@@ -26,13 +26,13 @@ from enum import Enum
 from typing import Optional, Dict, Any
 
 from config import (
-    ORDER_SIZE_BTC, MAX_CYCLES, PARADEX_ENV,
+    MARKET, ORDER_SIZE_ETH, MAX_CYCLES, PARADEX_ENV,
     MAX_CONSECUTIVE_FAILURES, EMERGENCY_STOP_FILE,
     ACCOUNT_A_L2_ADDRESS, ACCOUNT_A_L2_PRIVATE_KEY,
     ACCOUNT_B_L2_ADDRESS, ACCOUNT_B_L2_PRIVATE_KEY,
     ENTRY_ZERO_SPREAD_MS, MIN_DEPTH_MULTIPLIER,
     MAX_HOLD_SECONDS,
-    BURST_ZERO_SPREAD_MS, BURST_MIN_DEPTH_BTC,
+    BURST_ZERO_SPREAD_MS, BURST_MIN_DEPTH_ETH,
     MAX_ROUNDS_PER_BURST,
     TG_BOT_TOKEN, TG_CHAT_ID, TG_NOTIFY_INTERVAL, TG_ENABLED,
 )
@@ -63,7 +63,6 @@ logging.getLogger('paradex_py').setLevel(logging.WARNING)
 
 
 # ==================== 常量 ====================
-MARKET = "BTC-USD-PERP"
 MAX_ORDERS_PER_MINUTE = 30
 MAX_ORDERS_PER_HOUR = 300
 MAX_ORDERS_PER_DAY = 1000
@@ -196,7 +195,7 @@ class TelegramNotifier:
         msg = (
             "🚀 <b>Paradex 双账户对冲套利已启动</b>\n"
             "\n"
-            f"📊 单量: {ORDER_SIZE_BTC} BTC\n"
+            f"📊 单量: {ORDER_SIZE_ETH} ETH\n"
             f"🚦 限速: {MAX_ORDERS_PER_MINUTE}/分 | {MAX_ORDERS_PER_DAY}/日 (每账户)\n"
             f"💰 A 余额: ${bal_a:.4f}\n"
             f"💰 B 余额: ${bal_b:.4f}\n"
@@ -351,8 +350,8 @@ class MarketObserver:
         bbo = self.current_bbo
 
         if (self.zero_spread_duration_ms >= BURST_ZERO_SPREAD_MS
-                and bbo["bid_size"] >= BURST_MIN_DEPTH_BTC
-                and bbo["ask_size"] >= BURST_MIN_DEPTH_BTC):
+                and bbo["bid_size"] >= BURST_MIN_DEPTH_ETH
+                and bbo["ask_size"] >= BURST_MIN_DEPTH_ETH):
             if self.mode != "burst":
                 logger.info(
                     f"🔥 进入冲刺模式! 0差持续 {self.zero_spread_duration_ms:.0f}ms, "
@@ -602,11 +601,11 @@ class DualAccountController:
         print("=" * 72)
         print("🚀 Paradex BTC 双账户对冲套利 v1 - RPI 负点差套利版")
         print("=" * 72)
-        print(f"📊 单量: {ORDER_SIZE_BTC} BTC | 最大循环: {MAX_CYCLES}")
+        print(f"📊 单量: {ORDER_SIZE_ETH} ETH | 最大循环: {MAX_CYCLES}")
         print(f"⏱️  触发: 0差≥{ENTRY_ZERO_SPREAD_MS}ms | "
-              f"深度≥{ORDER_SIZE_BTC * MIN_DEPTH_MULTIPLIER:.3f} BTC")
+              f"深度≥{ORDER_SIZE_ETH * MIN_DEPTH_MULTIPLIER:.3f} ETH")
         print(f"🔥 冲刺: 0差≥{BURST_ZERO_SPREAD_MS}ms | "
-              f"深度≥{BURST_MIN_DEPTH_BTC} BTC | 每窗口≤{MAX_ROUNDS_PER_BURST}轮")
+              f"深度≥{BURST_MIN_DEPTH_ETH} ETH | 每窗口≤{MAX_ROUNDS_PER_BURST}轮")
         print(f"🚦 限速: {MAX_ORDERS_PER_MINUTE}/分 | "
               f"{MAX_ORDERS_PER_HOUR}/时 | {MAX_ORDERS_PER_DAY}/24h (每账户)")
         print("=" * 72)
@@ -770,7 +769,7 @@ class DualAccountController:
 
     async def _handle_idle(self):
         """IDLE: 等待 0 点差窗口开仓"""
-        min_depth = ORDER_SIZE_BTC * MIN_DEPTH_MULTIPLIER
+        min_depth = ORDER_SIZE_ETH * MIN_DEPTH_MULTIPLIER
 
         if not self.observer.is_entry_ready(ENTRY_ZERO_SPREAD_MS, min_depth):
             return
@@ -793,7 +792,7 @@ class DualAccountController:
             return
 
         # 平仓条件比开仓宽松: 0 差等待时间减半
-        min_depth = ORDER_SIZE_BTC * MIN_DEPTH_MULTIPLIER
+        min_depth = ORDER_SIZE_ETH * MIN_DEPTH_MULTIPLIER
         exit_min_ms = ENTRY_ZERO_SPREAD_MS / 2
 
         if not self.observer.is_entry_ready(exit_min_ms, min_depth):
@@ -819,12 +818,12 @@ class DualAccountController:
             a_side, b_side = "SELL", "BUY"
 
         dir_text = "A多B空" if self.current_direction == "A_LONG" else "A空B多"
-        logger.info(f"开仓: {dir_text} | {ORDER_SIZE_BTC} BTC")
+        logger.info(f"开仓: {dir_text} | {ORDER_SIZE_ETH} ETH")
 
         # 并行下单 (asyncio.to_thread 让两个 HTTP 同时发出)
         results = await asyncio.gather(
-            self.account_a.place_order_async(a_side, ORDER_SIZE_BTC),
-            self.account_b.place_order_async(b_side, ORDER_SIZE_BTC),
+            self.account_a.place_order_async(a_side, ORDER_SIZE_ETH),
+            self.account_b.place_order_async(b_side, ORDER_SIZE_ETH),
             return_exceptions=True,
         )
 
@@ -848,7 +847,7 @@ class DualAccountController:
             self.account_a.rate_limiter.record_order()
             try:
                 reverse = "SELL" if a_side == "BUY" else "BUY"
-                await self.account_a.place_order_async(reverse, ORDER_SIZE_BTC)
+                await self.account_a.place_order_async(reverse, ORDER_SIZE_ETH)
                 self.account_a.rate_limiter.record_order()
                 logger.info("[A] 回撤成功")
             except Exception as e:
@@ -863,7 +862,7 @@ class DualAccountController:
             self.account_b.rate_limiter.record_order()
             try:
                 reverse = "BUY" if b_side == "SELL" else "SELL"
-                await self.account_b.place_order_async(reverse, ORDER_SIZE_BTC)
+                await self.account_b.place_order_async(reverse, ORDER_SIZE_ETH)
                 self.account_b.rate_limiter.record_order()
                 logger.info("[B] 回撤成功")
             except Exception as e:
@@ -894,8 +893,8 @@ class DualAccountController:
 
         # 并行平仓
         results = await asyncio.gather(
-            self.account_a.place_order_async(a_side, ORDER_SIZE_BTC),
-            self.account_b.place_order_async(b_side, ORDER_SIZE_BTC),
+            self.account_a.place_order_async(a_side, ORDER_SIZE_ETH),
+            self.account_b.place_order_async(b_side, ORDER_SIZE_ETH),
             return_exceptions=True,
         )
 
@@ -915,7 +914,7 @@ class DualAccountController:
 
             # 记录成交量 & 延迟
             price = self.observer.current_bbo["mid_price"]
-            self.pnl_tracker.record_cycle(price, ORDER_SIZE_BTC)
+            self.pnl_tracker.record_cycle(price, ORDER_SIZE_ETH)
             latency_ms = (time.time() - cycle_start) * 1000
             self.latency_tracker.record_cycle_latency(latency_ms)
             logger.info(f"✅ 循环 {self.cycle_count} 完成 | {latency_ms:.0f}ms")
@@ -945,7 +944,7 @@ class DualAccountController:
                     and self.cycle_count < MAX_CYCLES
                     and not emergency):
 
-                min_depth = ORDER_SIZE_BTC * MIN_DEPTH_MULTIPLIER
+                min_depth = ORDER_SIZE_ETH * MIN_DEPTH_MULTIPLIER
 
                 # 冲刺时放宽条件: 只要当前仍是 0 差 + 深度够就行
                 if self.observer.is_entry_ready(0, min_depth):
@@ -1004,7 +1003,7 @@ class DualAccountController:
         """重试平仓, 最多 3 次"""
         for attempt in range(1, 4):
             try:
-                await account.place_order_async(side, ORDER_SIZE_BTC)
+                await account.place_order_async(side, ORDER_SIZE_ETH)
                 account.rate_limiter.record_order()
                 logger.info(f"[{name}] 重试平仓成功 (第{attempt}次)")
                 return True
@@ -1018,7 +1017,7 @@ class DualAccountController:
         self.cycle_count += 1
         self.successful_cycles += 1
         price = self.observer.current_bbo["mid_price"]
-        self.pnl_tracker.record_cycle(price, ORDER_SIZE_BTC)
+        self.pnl_tracker.record_cycle(price, ORDER_SIZE_ETH)
         self.current_direction = (
             "A_SHORT" if self.current_direction == "A_LONG" else "A_LONG"
         )

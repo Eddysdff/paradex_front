@@ -15,14 +15,16 @@ API_BASE_URL = "https://api.prod.paradex.trade"
 WS_URL = "wss://ws.api.prod.paradex.trade/v1"
 
 # ==================== 交易配置 ====================
-MARKET = "BTC-USD-PERP"
+MARKET = "ETH-USD-PERP"
 
-# 每单大小 (BTC)
-ORDER_SIZE_BTC = 0.008
+# 每单大小 (根据 MARKET 调整)
+# BTC-USD-PERP: 建议 0.006~0.01
+# ETH-USD-PERP: 建议 0.05~0.2
+ORDER_SIZE_ETH = 0.1
 
 # 价差阈值 (百分比)
 # 当价差 <= 此值时触发开仓
-MAX_SPREAD_PERCENT = 0.0006  # 0.0006%
+MAX_SPREAD_PERCENT = 0.0001  # 0.0006%
 
 # 最大循环次数 (一开一关为一个循环)
 # 每循环下2单，500循环 = 1000单 = Retail 24h 上限
@@ -66,8 +68,9 @@ MAX_HOLD_SECONDS = 30
 # 0 点差持续多久判定为冲刺窗口 (毫秒)
 BURST_ZERO_SPREAD_MS = 2000
 
-# 冲刺模式最低双边深度 (BTC)
-BURST_MIN_DEPTH_BTC = 0.03
+# 冲刺模式最低双边深度
+# BTC: 建议 0.03  |  ETH: 建议 0.5
+BURST_MIN_DEPTH_ETH = 1
 
 # 每次冲刺窗口内最多连续循环数
 MAX_ROUNDS_PER_BURST = 5
