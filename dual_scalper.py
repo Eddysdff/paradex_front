@@ -35,6 +35,7 @@ from config import (
     BURST_ZERO_SPREAD_MS, BURST_MIN_DEPTH_ETH,
     MAX_ROUNDS_PER_BURST,
     TG_BOT_TOKEN, TG_CHAT_ID, TG_NOTIFY_INTERVAL, TG_ENABLED,
+    BBO_RECORD_ENABLED, BBO_RECORD_DIR, BBO_RECORD_BUFFER_SIZE,
 )
 
 from paradex_py import ParadexSubkey
@@ -276,6 +277,80 @@ class TelegramNotifier:
         await self.send(msg)
 
 
+# ==================== BBO 数据记录器 ====================
+class BboDataRecorder:
+    """
+    BBO 盘口数据记录器 — 用于离线分析 0 点差规律
+    - 每天一个 CSV 文件: bbo_data/2026-02-09.csv
+    - 带写入缓冲, 减少磁盘 IO
+    - 记录字段: timestamp, bid, ask, bid_size, ask_size, spread_pct, zero_ms, mid_price
+    """
+
+    HEADER = "timestamp,bid,ask,bid_size,ask_size,spread_pct,zero_ms,mid_price\n"
+
+    def __init__(self, data_dir: str, buffer_size: int, enabled: bool):
+        self.data_dir = data_dir
+        self.buffer_size = buffer_size
+        self.enabled = enabled
+        self.current_date: str = ""
+        self.file = None
+        self.buffer: list[str] = []
+        self.total_records: int = 0
+
+        if self.enabled:
+            os.makedirs(data_dir, exist_ok=True)
+            logger.info(f"BBO 数据记录已启用 → {data_dir}/")
+
+    def record(self, now: float, bid: float, ask: float,
+               bid_size: float, ask_size: float,
+               spread_pct: float, zero_ms: float, mid_price: float):
+        """记录一条 BBO 快照"""
+        if not self.enabled:
+            return
+
+        # 按日切分文件
+        date_str = time.strftime("%Y-%m-%d", time.localtime(now))
+        if date_str != self.current_date:
+            self._rotate_file(date_str)
+
+        self.buffer.append(
+            f"{now:.3f},{bid},{ask},{bid_size},{ask_size},"
+            f"{spread_pct:.6f},{zero_ms:.1f},{mid_price:.2f}\n"
+        )
+        self.total_records += 1
+
+        if len(self.buffer) >= self.buffer_size:
+            self._flush()
+
+    def _rotate_file(self, date_str: str):
+        """切换到新日期的文件"""
+        self._flush()
+        if self.file:
+            self.file.close()
+
+        filepath = os.path.join(self.data_dir, f"{date_str}.csv")
+        is_new = not os.path.exists(filepath)
+        self.file = open(filepath, "a", encoding="utf-8")
+        if is_new:
+            self.file.write(self.HEADER)
+        self.current_date = date_str
+        logger.info(f"BBO 数据文件切换: {filepath}")
+
+    def _flush(self):
+        """把缓冲写入磁盘"""
+        if self.buffer and self.file:
+            self.file.writelines(self.buffer)
+            self.file.flush()
+            self.buffer.clear()
+
+    def close(self):
+        """关闭文件, 刷出剩余缓冲"""
+        self._flush()
+        if self.file:
+            self.file.close()
+            self.file = None
+
+
 # ==================== 市场观察器 ====================
 class MarketObserver:
     """
@@ -299,6 +374,13 @@ class MarketObserver:
 
         # 模式
         self.mode: str = "normal"   # "normal" 或 "burst"
+
+        # BBO 数据记录器
+        self.recorder = BboDataRecorder(
+            data_dir=BBO_RECORD_DIR,
+            buffer_size=BBO_RECORD_BUFFER_SIZE,
+            enabled=BBO_RECORD_ENABLED,
+        )
 
     async def on_bbo_update(self, channel, message):
         """WebSocket BBO 消息回调"""
@@ -334,6 +416,12 @@ class MarketObserver:
             else:
                 self.zero_spread_start = 0
                 self.zero_spread_duration_ms = 0
+
+            # 记录 BBO 数据 (用于离线分析, 在 0 差计算之后)
+            self.recorder.record(
+                now, bid, ask, bid_size, ask_size,
+                spread_pct, self.zero_spread_duration_ms, mid,
+            )
 
             # 检测冲刺模式
             self._detect_burst_mode()
@@ -1088,6 +1176,11 @@ class DualAccountController:
     async def shutdown(self):
         """关闭策略, 输出最终统计"""
         self.running = False
+
+        # 关闭 BBO 数据记录器 (刷出剩余缓冲)
+        self.observer.recorder.close()
+        if self.observer.recorder.total_records > 0:
+            print(f"📝 BBO 数据已保存: {self.observer.recorder.total_records} 条 → {BBO_RECORD_DIR}/")
 
         # 最终余额
         try:

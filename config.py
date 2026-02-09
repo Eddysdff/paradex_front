@@ -91,3 +91,13 @@ TG_NOTIFY_INTERVAL = 10
 
 # 是否启用 Telegram 通知 (填好 Token 和 Chat ID 后自动启用)
 TG_ENABLED = True
+
+# ==================== BBO 数据记录 (离线分析) ====================
+# 是否记录 BBO 数据到 CSV
+BBO_RECORD_ENABLED = True
+
+# 数据存储目录 (每天一个 CSV 文件)
+BBO_RECORD_DIR = "bbo_data"
+
+# 写入缓冲大小 (每 N 条刷盘一次, 越大越快但断电丢数据越多)
+BBO_RECORD_BUFFER_SIZE = 100
