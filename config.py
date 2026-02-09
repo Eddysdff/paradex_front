@@ -24,7 +24,7 @@ ORDER_SIZE_ETH = 0.1
 
 # 价差阈值 (百分比)
 # 当价差 <= 此值时触发开仓
-MAX_SPREAD_PERCENT = 0.0001  # 0.0006%
+MAX_SPREAD_PERCENT = 0.001  # 0.0006%
 
 # 最大循环次数 (一开一关为一个循环)
 # 每循环下2单，500循环 = 1000单 = Retail 24h 上限
@@ -55,6 +55,10 @@ ACCOUNT_B_L2_ADDRESS = ""
 ACCOUNT_B_L2_PRIVATE_KEY = ""
 
 # ==================== 对冲策略参数 ====================
+# 视为 "0 点差" 的阈值 (百分比)
+# Paradex 显示精度为 0.001%，低于此值视为 0 点差
+ZERO_SPREAD_THRESHOLD = 0.001
+
 # 0 点差需持续多久才触发开/平仓 (毫秒)
 ENTRY_ZERO_SPREAD_MS = 300
 

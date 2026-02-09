@@ -30,7 +30,7 @@ from config import (
     MAX_CONSECUTIVE_FAILURES, EMERGENCY_STOP_FILE,
     ACCOUNT_A_L2_ADDRESS, ACCOUNT_A_L2_PRIVATE_KEY,
     ACCOUNT_B_L2_ADDRESS, ACCOUNT_B_L2_PRIVATE_KEY,
-    ENTRY_ZERO_SPREAD_MS, MIN_DEPTH_MULTIPLIER,
+    ZERO_SPREAD_THRESHOLD, ENTRY_ZERO_SPREAD_MS, MIN_DEPTH_MULTIPLIER,
     MAX_HOLD_SECONDS,
     BURST_ZERO_SPREAD_MS, BURST_MIN_DEPTH_ETH,
     MAX_ROUNDS_PER_BURST,
@@ -326,8 +326,8 @@ class MarketObserver:
                 "last_update": now,
             }
 
-            # 追踪 0 点差持续时间 (spread < 0.0001% 视为 0)
-            if spread_pct < 0.0001:
+            # 追踪 0 点差持续时间 (低于阈值视为 0)
+            if spread_pct < ZERO_SPREAD_THRESHOLD:
                 if self.zero_spread_start == 0:
                     self.zero_spread_start = now
                 self.zero_spread_duration_ms = (now - self.zero_spread_start) * 1000
@@ -372,7 +372,7 @@ class MarketObserver:
             return False
 
         # 必须 0 点差
-        if bbo["spread"] >= 0.0001:
+        if bbo["spread"] >= ZERO_SPREAD_THRESHOLD:
             return False
 
         # 0 点差持续 >= min_ms

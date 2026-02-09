@@ -1,0 +1,7 @@
+2026-02-09 20:50:05,270 - INFO - Telegram 通知已启用
+2026-02-09 20:50:07,190 - INFO - [A] Interactive Token 获取成功
+2026-02-09 20:50:09,441 - INFO - [B] Interactive Token 获取成功
+2026-02-09 20:54:48,980 - INFO - Telegram 通知已启用
+2026-02-09 20:54:48,995 - ERROR - [A] 连接失败: Using SOCKS proxy, but the 'socksio' package is not installed. Make sure to install httpx using `pip install httpx[socks]`.
+2026-02-09 20:55:14,258 - INFO - Telegram 通知已启用
+2026-02-09 20:55:14,274 - ERROR - [A] 连接失败: Using SOCKS proxy, but the 'socksio' package is not installed. Make sure to install httpx using `pip install httpx[socks]`.
