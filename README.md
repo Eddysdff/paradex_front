@@ -53,18 +53,3 @@ python3 dual_scalper.py --coin ETH
 | `bbo_analysis.py` | BBO 数据离线分析 |
 | `scalper.py` | 旧版单账户脚本 (参考) |
 
-## 紧急停止
-
-创建 `STOP` 文件即可停止：
-
-```bash
-touch STOP
-```
-
-## 数据分析
-
-脚本运行时自动记录 BBO 到 `bbo_data/` 目录，用分析脚本查看 0 差规律：
-
-```bash
-python3 bbo_analysis.py bbo_data/2026-02-09.csv
-```
