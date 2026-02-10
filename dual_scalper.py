@@ -1,22 +1,6 @@
-"""
-Paradex BTC 双账户对冲套利脚本 v1 - RPI 负点差套利版
-
-策略逻辑:
-1. WebSocket 实时监控 BTC-USD-PERP 盘口
-2. 当 spread == 0 稳定 >= Nms 且深度足够时:
-   - 账户 A 和账户 B 同时下反向市价单
-   - 至少一边吃到 RPI 改善价 → 超低磨损 / 正收益
-3. 持仓等待下一个 0 点差窗口，然后平仓
-4. 交替方向，循环刷量
-5. 检测到 "厚深度 + 持续0差" 时进入冲刺模式，加速循环
-
-限制 (保持免费 Retail 档):
-- 每账户: 30 单/min, 300 单/hr, 1000 单/24h
-- Retail 模式 ~500ms speed bump
-"""
-
 import asyncio
 import logging
+import math
 import time
 import os
 import sys
@@ -27,11 +11,12 @@ from typing import Optional, Dict, Any
 
 from config import (
     COIN_PRESETS, DEFAULT_COIN,
-    MARKET, ORDER_SIZE, MAX_CYCLES, PARADEX_ENV,
+    MARKET, ORDER_SIZE, MIN_ORDER_SIZE, SIZE_DECIMALS,
+    MAX_CYCLES, PARADEX_ENV,
     MAX_CONSECUTIVE_FAILURES, EMERGENCY_STOP_FILE,
     ACCOUNT_A_L2_ADDRESS, ACCOUNT_A_L2_PRIVATE_KEY,
     ACCOUNT_B_L2_ADDRESS, ACCOUNT_B_L2_PRIVATE_KEY,
-    ZERO_SPREAD_THRESHOLD, ENTRY_ZERO_SPREAD_MS, MIN_DEPTH_MULTIPLIER,
+    ZERO_SPREAD_THRESHOLD, ENTRY_ZERO_SPREAD_MS, DEPTH_SAFETY_FACTOR,
     MAX_HOLD_SECONDS,
     BURST_ZERO_SPREAD_MS, BURST_MIN_DEPTH,
     MAX_ROUNDS_PER_BURST,
@@ -39,15 +24,15 @@ from config import (
     BBO_RECORD_ENABLED, BBO_RECORD_DIR, BBO_RECORD_BUFFER_SIZE,
 )
 
-# 运行时覆盖的变量 (由 select_coin() 设置)
-COIN_SYMBOL = DEFAULT_COIN  # 当前选择的币种符号 (BTC / ETH / SOL)
+# Runtime overrides (set by select_coin → apply_coin_preset)
+COIN_SYMBOL = DEFAULT_COIN
 
 from paradex_py import ParadexSubkey
 from paradex_py.api.ws_client import ParadexWebsocketChannel
 from paradex_py.common.order import Order, OrderType, OrderSide
 
 
-# ==================== 日志配置 ====================
+# ─── Logging ───
 LOG_FILE = "dual_scalper.log"
 
 file_handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
@@ -67,21 +52,21 @@ logging.getLogger('websockets').setLevel(logging.WARNING)
 logging.getLogger('paradex_py').setLevel(logging.WARNING)
 
 
-# ==================== 常量 ====================
+# ─── Rate limits (Retail profile) ───
 MAX_ORDERS_PER_MINUTE = 30
 MAX_ORDERS_PER_HOUR = 300
 MAX_ORDERS_PER_DAY = 1000
 
 
-# ==================== 枚举 ====================
+# ─── State ───
 class StrategyState(Enum):
-    IDLE = "IDLE"         # 无仓位，等待机会
-    HOLDING = "HOLDING"   # 双向持仓中，等待平仓机会
+    IDLE = "IDLE"
+    HOLDING = "HOLDING"
 
 
-# ==================== 速率限制器 ====================
+# ─── Rate Limiter ───
 class RateLimiter:
-    """三级速率限制器: 分钟/小时/24小时"""
+    """Sliding-window rate limiter (minute / hour / day)."""
 
     def __init__(self, per_minute: int, per_hour: int, per_day: int):
         self.per_minute = per_minute
@@ -118,9 +103,9 @@ class RateLimiter:
         return len(self.minute_orders), len(self.hour_orders), len(self.day_orders)
 
 
-# ==================== 延迟追踪器 ====================
+# ─── Latency Tracker ───
 class LatencyTracker:
-    """记录每轮开平仓耗时"""
+    """Tracks recent cycle and WebSocket latencies."""
 
     def __init__(self, max_records: int = 5):
         self.recent_latencies: deque = deque(maxlen=max_records)
@@ -150,14 +135,9 @@ class LatencyTracker:
         return "/".join([f"{lat:.0f}" for lat in self.recent_latencies])
 
 
-# ==================== Telegram 通知 ====================
+# ─── Telegram Notifier ───
 class TelegramNotifier:
-    """
-    Telegram Bot 通知器:
-    - 纯 stdlib 实现 (urllib), 无额外依赖
-    - 异步发送, 不阻塞主循环
-    - 发送失败只记日志, 不影响策略运行
-    """
+    """Async Telegram alerts via stdlib urllib. Non-blocking, fail-safe."""
 
     def __init__(self, bot_token: str, chat_id: str, enabled: bool = True):
         self.bot_token = bot_token
@@ -200,7 +180,7 @@ class TelegramNotifier:
         msg = (
             "🚀 <b>Paradex 双账户对冲套利已启动</b>\n"
             "\n"
-            f"📊 市场: {MARKET} | 单量: {ORDER_SIZE} {COIN_SYMBOL}\n"
+            f"📊 市场: {MARKET} | 最大单量: {ORDER_SIZE} {COIN_SYMBOL} (动态)\n"
             f"🚦 限速: {MAX_ORDERS_PER_MINUTE}/分 | {MAX_ORDERS_PER_DAY}/日 (每账户)\n"
             f"💰 A 余额: ${bal_a:.4f}\n"
             f"💰 B 余额: ${bal_b:.4f}\n"
@@ -281,14 +261,9 @@ class TelegramNotifier:
         await self.send(msg)
 
 
-# ==================== BBO 数据记录器 ====================
+# ─── BBO Data Recorder ───
 class BboDataRecorder:
-    """
-    BBO 盘口数据记录器 — 用于离线分析 0 点差规律
-    - 每天一个 CSV 文件: bbo_data/2026-02-09.csv
-    - 带写入缓冲, 减少磁盘 IO
-    - 记录字段: timestamp, bid, ask, bid_size, ask_size, spread_pct, zero_ms, mid_price
-    """
+    """Writes BBO snapshots to daily CSV files for offline analysis."""
 
     HEADER = "timestamp,bid,ask,bid_size,ask_size,spread_pct,zero_ms,mid_price\n"
 
@@ -355,14 +330,9 @@ class BboDataRecorder:
             self.file = None
 
 
-# ==================== 市场观察器 ====================
+# ─── Market Observer ───
 class MarketObserver:
-    """
-    WebSocket 实时盘口监控:
-    - 追踪 BBO (买一/卖一/深度)
-    - 追踪 0 点差持续时长
-    - 检测 "冲刺模式" (厚深度 + 持续0差)
-    """
+    """Real-time BBO monitor: spread tracking, zero-gap timing, burst detection."""
 
     def __init__(self):
         self.current_bbo: Dict[str, Any] = {
@@ -387,7 +357,7 @@ class MarketObserver:
         )
 
     async def on_bbo_update(self, channel, message):
-        """WebSocket BBO 消息回调"""
+        """WebSocket BBO callback — updates spread, zero-gap timer, burst mode."""
         try:
             data = message.get("params", {}).get("data", {})
             if not data:
@@ -434,11 +404,7 @@ class MarketObserver:
             logger.error(f"BBO 解析错误: {e}")
 
     def _detect_burst_mode(self):
-        """
-        冲刺模式判定:
-        - 0 点差持续 >= BURST_ZERO_SPREAD_MS
-        - 双边深度 >= BURST_MIN_DEPTH_BTC
-        """
+        """Enter burst mode when zero-gap persists and depth is thick on both sides."""
         bbo = self.current_bbo
 
         if (self.zero_spread_duration_ms >= BURST_ZERO_SPREAD_MS
@@ -455,8 +421,8 @@ class MarketObserver:
                 logger.info("📉 退出冲刺模式")
             self.mode = "normal"
 
-    def is_entry_ready(self, min_ms: float, min_depth: float) -> bool:
-        """检查是否满足开/平仓条件"""
+    def is_spread_ready(self, min_ms: float) -> bool:
+        """True if spread ≤ threshold for at least min_ms (ignores depth)."""
         bbo = self.current_bbo
 
         # 数据不能太旧 (>1s 视为过期)
@@ -471,22 +437,38 @@ class MarketObserver:
         if self.zero_spread_duration_ms < min_ms:
             return False
 
-        # 双边深度足够
-        if bbo["bid_size"] < min_depth or bbo["ask_size"] < min_depth:
-            return False
-
         return True
 
+    def calc_safe_size(self) -> float:
+        """Dynamic order size = min(ORDER_SIZE, thin_side × safety_factor). Returns 0 if below minimum."""
+        bbo = self.current_bbo
 
-# ==================== 单账户交易器 ====================
+        if time.time() - bbo["last_update"] > 1.0:
+            return 0
+
+        thin_side = min(bbo["bid_size"], bbo["ask_size"])
+        safe = min(ORDER_SIZE, thin_side * DEPTH_SAFETY_FACTOR)
+
+        if safe < MIN_ORDER_SIZE:
+            return 0
+
+        # 向下取整到下单精度, 避免被交易所拒绝
+        factor = 10 ** SIZE_DECIMALS
+        safe = math.floor(safe * factor) / factor
+
+        return safe
+
+    def can_fill_close(self, size: float) -> bool:
+        """True if both sides have enough depth to fill a close order of given size."""
+        bbo = self.current_bbo
+        if time.time() - bbo["last_update"] > 1.0:
+            return False
+        return bbo["bid_size"] >= size and bbo["ask_size"] >= size
+
+
+# ─── Account Trader ───
 class AccountTrader:
-    """
-    封装单个 Paradex 账户:
-    - 连接 / 认证 (Interactive Token)
-    - 下市价单 (同步 + 异步)
-    - 查余额
-    - 独立速率限制
-    """
+    """Single Paradex account: auth, market orders, balance, rate limiting."""
 
     def __init__(self, name: str, l2_address: str, l2_private_key: str):
         self.name = name
@@ -500,7 +482,7 @@ class AccountTrader:
         self.order_count: int = 0
 
     async def connect(self) -> bool:
-        """连接并初始化账户"""
+        """Connect to Paradex and obtain interactive token."""
         try:
             env = "prod" if PARADEX_ENV == "MAINNET" else "testnet"
             self.paradex = ParadexSubkey(
@@ -516,7 +498,7 @@ class AccountTrader:
             return False
 
     async def auth_interactive(self):
-        """获取 Interactive Token (免费交易, 有 500ms speed bump)"""
+        """Obtain interactive token (0% fees, 500ms speed bump)."""
         import time as time_module
         from paradex_py.api.models import AuthSchema
 
@@ -536,12 +518,12 @@ class AccountTrader:
         logger.info(f"[{self.name}] Interactive Token 获取成功")
 
     async def refresh_token_if_needed(self, max_age: int = 240):
-        """Token 快过期时自动刷新 (默认 4 分钟刷新, token 5 分钟过期)"""
+        """Auto-refresh token before expiry (token TTL ~5min, refresh at 4min)."""
         if time.time() - self.last_auth_time >= max_age:
             await self.auth_interactive()
 
     def _place_order_sync(self, side: str, size: float) -> dict:
-        """同步下市价单 (会阻塞线程)"""
+        """Blocking market order (runs in thread pool)."""
         order = Order(
             market=MARKET,
             order_type=OrderType.Market,
@@ -553,11 +535,11 @@ class AccountTrader:
         return result
 
     async def place_order_async(self, side: str, size: float) -> dict:
-        """异步下市价单 (不阻塞事件循环, 可并行调用 A/B)"""
+        """Async market order — non-blocking, parallelizable via gather."""
         return await asyncio.to_thread(self._place_order_sync, side, size)
 
     def _get_balance_sync(self) -> float:
-        """同步获取账户余额"""
+        """Blocking balance fetch."""
         try:
             summary = self.paradex.api_client.fetch_account_summary()
             if hasattr(summary, 'account_value') and summary.account_value:
@@ -571,21 +553,21 @@ class AccountTrader:
             return -1
 
     async def get_balance_async(self) -> float:
-        """异步获取账户余额"""
+        """Async balance fetch."""
         return await asyncio.to_thread(self._get_balance_sync)
 
     def can_trade(self) -> tuple[bool, float, str]:
-        """检查速率限制是否允许下单"""
+        """Check if rate limits allow placing an order."""
         return self.rate_limiter.can_place_order()
 
     def get_pnl(self) -> float:
-        """当前盈亏 (基于真实余额变化)"""
+        """Realized PnL based on balance delta."""
         return self.current_balance - self.initial_balance
 
 
-# ==================== 双账户盈亏统计 ====================
+# ─── PnL Tracker ───
 class DualPnLTracker:
-    """双账户合并盈亏 & 成交量统计"""
+    """Combined PnL and volume tracker for both accounts."""
 
     def __init__(self):
         self.total_volume_usd: float = 0.0
@@ -620,11 +602,80 @@ class DualPnLTracker:
         }
 
 
-# ==================== 固定面板显示 ====================
-class FixedPanel:
-    """终端固定面板 (覆盖式刷新, 不滚动)"""
+# ─── ANSI Colors ───
+class C:
+    """ANSI escape sequences for terminal styling."""
+    RST  = "\033[0m"
+    BOLD = "\033[1m"
+    DIM  = "\033[2m"
+    RED    = "\033[31m"
+    GREEN  = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE   = "\033[34m"
+    PURPLE = "\033[35m"
+    CYAN   = "\033[36m"
+    WHITE  = "\033[37m"
+    # 亮色
+    BRED   = "\033[91m"
+    BGREEN = "\033[92m"
+    BYELLOW = "\033[93m"
+    BCYAN  = "\033[96m"
+    BWHITE = "\033[97m"
 
-    PANEL_LINES = 11
+    @staticmethod
+    def pnl(val: float) -> str:
+        """PnL 上色: 绿正红负"""
+        if val > 0:
+            return f"{C.BGREEN}+{val:.4f}{C.RST}"
+        elif val < 0:
+            return f"{C.BRED}{val:.4f}{C.RST}"
+        return f"{C.DIM}0.0000{C.RST}"
+
+    @staticmethod
+    def spread_color(spread: float, threshold: float) -> str:
+        """价差上色: 绿=0差 黄=接近 红=远"""
+        if spread < threshold:
+            return f"{C.BGREEN}{spread:.5f}%{C.RST}"
+        elif spread < threshold * 5:
+            return f"{C.BYELLOW}{spread:.5f}%{C.RST}"
+        return f"{C.DIM}{spread:.5f}%{C.RST}"
+
+    @staticmethod
+    def bar(current: int, maximum: int, width: int = 10) -> str:
+        """进度条: ████░░░░"""
+        ratio = min(current / maximum, 1.0) if maximum > 0 else 0
+        filled = int(ratio * width)
+        empty = width - filled
+        if ratio >= 0.9:
+            color = C.BRED
+        elif ratio >= 0.7:
+            color = C.BYELLOW
+        else:
+            color = C.BCYAN
+        return f"{color}{'█' * filled}{C.DIM}{'░' * empty}{C.RST}"
+
+    @staticmethod
+    def state_badge(state_val: str) -> str:
+        """状态标签上色"""
+        if state_val == "IDLE":
+            return f"{C.BCYAN}{C.BOLD} IDLE {C.RST}"
+        elif state_val == "HOLDING":
+            return f"{C.BYELLOW}{C.BOLD} HOLD {C.RST}"
+        return f"{C.DIM} {state_val} {C.RST}"
+
+    @staticmethod
+    def mode_badge(mode: str) -> str:
+        """模式标签"""
+        if mode == "burst":
+            return f"{C.BRED}{C.BOLD}⚡BURST{C.RST}"
+        return f"{C.DIM}NORMAL{C.RST}"
+
+
+# ─── Display Panel ───
+class FixedPanel:
+    """Fixed-position terminal panel with ANSI overwrite refresh."""
+
+    PANEL_LINES = 14
 
     def __init__(self):
         self.initialized = False
@@ -645,14 +696,9 @@ class FixedPanel:
         sys.stdout.flush()
 
 
-# ==================== 双账户策略控制器 ====================
+# ─── Strategy Controller ───
 class DualAccountController:
-    """
-    核心状态机:
-      IDLE  ──(0差+深度+限速OK)──▶  HOLDING
-               ◀──(0差+深度+限速OK / 超时强平)──
-    冲刺模式: CLOSING 后立即重新 OPENING, 不回 IDLE
-    """
+    """Core state machine: IDLE ⇄ HOLDING, with optional BURST acceleration."""
 
     def __init__(self):
         self.observer = MarketObserver()
@@ -677,8 +723,9 @@ class DualAccountController:
         # 方向控制 (每轮交替)
         self.current_direction = "A_LONG"   # "A_LONG" 或 "A_SHORT"
 
-        # 持仓计时
+        # 持仓计时 & 动态单量
         self.hold_start_time: float = 0
+        self.current_position_size: float = 0  # 当前持仓单量 (平仓时用)
 
         # 冲刺模式
         self.burst_rounds: int = 0
@@ -687,20 +734,30 @@ class DualAccountController:
         self._last_tg_cycle: int = 0          # 上次发 TG 时的循环数
         self._burst_notified: bool = False     # 本次冲刺窗口是否已通知
 
-    # ────────────────── 启动流程 ──────────────────
+    # ─── Startup ───
 
     async def start(self):
-        print("=" * 72)
-        print(f"🚀 Paradex {COIN_SYMBOL} 双账户对冲套利 v1 - RPI 负点差套利版")
-        print("=" * 72)
-        print(f"📊 市场: {MARKET} | 单量: {ORDER_SIZE} {COIN_SYMBOL} | 最大循环: {MAX_CYCLES}")
-        print(f"⏱️  触发: 0差≥{ENTRY_ZERO_SPREAD_MS}ms | "
-              f"深度≥{ORDER_SIZE * MIN_DEPTH_MULTIPLIER:.3f} {COIN_SYMBOL}")
-        print(f"🔥 冲刺: 0差≥{BURST_ZERO_SPREAD_MS}ms | "
-              f"深度≥{BURST_MIN_DEPTH} {COIN_SYMBOL} | 每窗口≤{MAX_ROUNDS_PER_BURST}轮")
-        print(f"🚦 限速: {MAX_ORDERS_PER_MINUTE}/分 | "
-              f"{MAX_ORDERS_PER_HOUR}/时 | {MAX_ORDERS_PER_DAY}/24h (每账户)")
-        print("=" * 72)
+        W = 74
+        BAR = f"{C.BCYAN}{'━' * W}{C.RST}"
+        print()
+        print(BAR)
+        print(f"  {C.BOLD}{C.BWHITE}PARADEX DUAL HEDGE v1{C.RST}"
+              f"  {C.DIM}RPI Negative Spread Arbitrage{C.RST}")
+        print(BAR)
+        print(f"  {C.BOLD}MARKET{C.RST}  {C.BWHITE}{MARKET}{C.RST}"
+              f"    {C.BOLD}SIZE{C.RST}  {ORDER_SIZE} {COIN_SYMBOL} {C.DIM}(dynamic){C.RST}"
+              f"    {C.BOLD}MAX{C.RST}  {MAX_CYCLES} cycles")
+        print(f"  {C.BOLD}ENTRY{C.RST}   0-gap ≥{ENTRY_ZERO_SPREAD_MS}ms"
+              f"    {C.BOLD}SAFETY{C.RST}  ×{DEPTH_SAFETY_FACTOR}"
+              f"    {C.BOLD}MIN{C.RST}  {MIN_ORDER_SIZE} {COIN_SYMBOL}")
+        print(f"  {C.BOLD}BURST{C.RST}   0-gap ≥{BURST_ZERO_SPREAD_MS}ms"
+              f"    {C.BOLD}DEPTH{C.RST}   ≥{BURST_MIN_DEPTH} {COIN_SYMBOL}"
+              f"    {C.BOLD}MAX{C.RST}  {MAX_ROUNDS_PER_BURST} rounds")
+        print(f"  {C.BOLD}RATE{C.RST}    {MAX_ORDERS_PER_MINUTE}/min"
+              f"  {MAX_ORDERS_PER_HOUR}/hr"
+              f"  {MAX_ORDERS_PER_DAY}/day {C.DIM}(per account){C.RST}")
+        print(BAR)
+        print()
 
         # 检查配置
         if not ACCOUNT_A_L2_ADDRESS or not ACCOUNT_A_L2_PRIVATE_KEY:
@@ -736,7 +793,7 @@ class DualAccountController:
             await self.shutdown()
 
     async def _connect_accounts(self) -> bool:
-        """连接两个账户 (串行, 因为各自要做 L2 认证)"""
+        """Connect both accounts sequentially (each requires L2 auth)."""
         env = "prod" if PARADEX_ENV == "MAINNET" else "testnet"
 
         print(f"🔌 连接账户 A ({env})...")
@@ -756,7 +813,7 @@ class DualAccountController:
         return True
 
     async def _subscribe_bbo(self) -> bool:
-        """通过账户 A 的 WebSocket 订阅 BBO"""
+        """Subscribe to BBO via Account A's WebSocket."""
         try:
             print("📡 连接 WebSocket...")
             await self.account_a.paradex.ws_client.connect()
@@ -782,7 +839,7 @@ class DualAccountController:
             return False
 
     async def _init_balances(self) -> bool:
-        """并行查询两个账户的初始余额"""
+        """Fetch initial balances for both accounts in parallel."""
         bal_a, bal_b = await asyncio.gather(
             self.account_a.get_balance_async(),
             self.account_b.get_balance_async(),
@@ -805,7 +862,7 @@ class DualAccountController:
         print(f"💰 合计: ${bal_a + bal_b:.4f} USDC")
         return True
 
-    # ────────────────── 主循环 ──────────────────
+    # ─── Main Loop ───
 
     async def main_loop(self):
         last_balance_check: float = 0
@@ -857,37 +914,43 @@ class DualAccountController:
 
             await asyncio.sleep(0.05)
 
-    # ────────────────── 状态处理 ──────────────────
+    # ─── State Handlers ───
 
     async def _handle_idle(self):
-        """IDLE: 等待 0 点差窗口开仓"""
-        min_depth = ORDER_SIZE * MIN_DEPTH_MULTIPLIER
-
-        if not self.observer.is_entry_ready(ENTRY_ZERO_SPREAD_MS, min_depth):
+        """IDLE → check zero-gap + dynamic size → open both."""
+        # 1. 价差条件
+        if not self.observer.is_spread_ready(ENTRY_ZERO_SPREAD_MS):
             return
 
-        # 两个账户都要有下单额度
+        # 2. 动态计算安全单量 (根据薄边深度)
+        safe_size = self.observer.calc_safe_size()
+        if safe_size <= 0:
+            return
+
+        # 3. 两个账户都要有下单额度
         can_a, _, _ = self.account_a.can_trade()
         can_b, _, _ = self.account_b.can_trade()
         if not can_a or not can_b:
             return
 
-        await self._open_both()
+        await self._open_both(safe_size)
 
     async def _handle_holding(self):
-        """HOLDING: 等待 0 点差窗口平仓, 或超时强平"""
-        # 超时强制平仓
+        """HOLDING → wait for zero-gap to close, or force-close on timeout."""
+        # 超时强制平仓 (不管深度, 必须平)
         hold_time = time.time() - self.hold_start_time
         if hold_time > MAX_HOLD_SECONDS:
             logger.warning(f"持仓超时 ({hold_time:.1f}s > {MAX_HOLD_SECONDS}s), 强制平仓")
             await self._close_both(emergency=True)
             return
 
-        # 平仓条件比开仓宽松: 0 差等待时间减半
-        min_depth = ORDER_SIZE * MIN_DEPTH_MULTIPLIER
+        # 平仓条件: 0差等待时间减半 + 双边深度能填平仓单量
         exit_min_ms = ENTRY_ZERO_SPREAD_MS / 2
 
-        if not self.observer.is_entry_ready(exit_min_ms, min_depth):
+        if not self.observer.is_spread_ready(exit_min_ms):
+            return
+
+        if not self.observer.can_fill_close(self.current_position_size):
             return
 
         # 两个账户都要有下单额度
@@ -898,10 +961,10 @@ class DualAccountController:
 
         await self._close_both()
 
-    # ────────────────── 开仓 / 平仓 ──────────────────
+    # ─── Open / Close ───
 
-    async def _open_both(self):
-        """同时开仓: A 和 B 下反向市价单"""
+    async def _open_both(self, size: float):
+        """Place opposing market orders on A and B simultaneously."""
         cycle_start = time.time()
 
         if self.current_direction == "A_LONG":
@@ -910,12 +973,14 @@ class DualAccountController:
             a_side, b_side = "SELL", "BUY"
 
         dir_text = "A多B空" if self.current_direction == "A_LONG" else "A空B多"
-        logger.info(f"开仓: {dir_text} | {ORDER_SIZE} {COIN_SYMBOL}")
+        bbo = self.observer.current_bbo
+        logger.info(f"开仓: {dir_text} | {size} {COIN_SYMBOL} "
+                     f"(薄边:{min(bbo['bid_size'], bbo['ask_size']):.4f})")
 
         # 并行下单 (asyncio.to_thread 让两个 HTTP 同时发出)
         results = await asyncio.gather(
-            self.account_a.place_order_async(a_side, ORDER_SIZE),
-            self.account_b.place_order_async(b_side, ORDER_SIZE),
+            self.account_a.place_order_async(a_side, size),
+            self.account_b.place_order_async(b_side, size),
             return_exceptions=True,
         )
 
@@ -923,15 +988,16 @@ class DualAccountController:
         b_ok = not isinstance(results[1], Exception)
 
         if a_ok and b_ok:
-            # ✅ 两边都成功
+            # ✅ 两边都成功 → 记录持仓单量
             self.account_a.rate_limiter.record_order()
             self.account_b.rate_limiter.record_order()
+            self.current_position_size = size
             self.state = StrategyState.HOLDING
             self.hold_start_time = time.time()
             self.consecutive_failures = 0
 
             latency_ms = (time.time() - cycle_start) * 1000
-            logger.info(f"开仓成功 | {dir_text} | {latency_ms:.0f}ms")
+            logger.info(f"开仓成功 | {dir_text} | {size} {COIN_SYMBOL} | {latency_ms:.0f}ms")
 
         elif a_ok and not b_ok:
             # ⚠️ A 成功 B 失败 → 立刻回撤 A
@@ -939,7 +1005,7 @@ class DualAccountController:
             self.account_a.rate_limiter.record_order()
             try:
                 reverse = "SELL" if a_side == "BUY" else "BUY"
-                await self.account_a.place_order_async(reverse, ORDER_SIZE)
+                await self.account_a.place_order_async(reverse, size)
                 self.account_a.rate_limiter.record_order()
                 logger.info("[A] 回撤成功")
             except Exception as e:
@@ -954,7 +1020,7 @@ class DualAccountController:
             self.account_b.rate_limiter.record_order()
             try:
                 reverse = "BUY" if b_side == "SELL" else "SELL"
-                await self.account_b.place_order_async(reverse, ORDER_SIZE)
+                await self.account_b.place_order_async(reverse, size)
                 self.account_b.rate_limiter.record_order()
                 logger.info("[B] 回撤成功")
             except Exception as e:
@@ -971,8 +1037,9 @@ class DualAccountController:
             self.failed_cycles += 1
 
     async def _close_both(self, emergency: bool = False):
-        """同时平仓, 成功后可触发冲刺模式连续开仓"""
+        """Close both positions. On success, may trigger burst re-open."""
         cycle_start = time.time()
+        close_size = self.current_position_size  # 用开仓时的单量平仓
 
         # 平仓方向: 和开仓相反
         if self.current_direction == "A_LONG":
@@ -981,12 +1048,12 @@ class DualAccountController:
             a_side, b_side = "BUY", "SELL"    # A 平空, B 平多
 
         tag = " (超时强制)" if emergency else ""
-        logger.info(f"平仓{tag}")
+        logger.info(f"平仓{tag} | {close_size} {COIN_SYMBOL}")
 
         # 并行平仓
         results = await asyncio.gather(
-            self.account_a.place_order_async(a_side, ORDER_SIZE),
-            self.account_b.place_order_async(b_side, ORDER_SIZE),
+            self.account_a.place_order_async(a_side, close_size),
+            self.account_b.place_order_async(b_side, close_size),
             return_exceptions=True,
         )
 
@@ -1004,12 +1071,12 @@ class DualAccountController:
             self.successful_cycles += 1
             self.consecutive_failures = 0
 
-            # 记录成交量 & 延迟
+            # 记录成交量 & 延迟 (使用实际平仓单量)
             price = self.observer.current_bbo["mid_price"]
-            self.pnl_tracker.record_cycle(price, ORDER_SIZE)
+            self.pnl_tracker.record_cycle(price, close_size)
             latency_ms = (time.time() - cycle_start) * 1000
             self.latency_tracker.record_cycle_latency(latency_ms)
-            logger.info(f"✅ 循环 {self.cycle_count} 完成 | {latency_ms:.0f}ms")
+            logger.info(f"✅ 循环 {self.cycle_count} 完成 | {close_size} {COIN_SYMBOL} | {latency_ms:.0f}ms")
 
             # 更新余额 (知道真实盈亏)
             await self._update_balances()
@@ -1036,25 +1103,25 @@ class DualAccountController:
                     and self.cycle_count < MAX_CYCLES
                     and not emergency):
 
-                min_depth = ORDER_SIZE * MIN_DEPTH_MULTIPLIER
-
-                # 冲刺时放宽条件: 只要当前仍是 0 差 + 深度够就行
-                if self.observer.is_entry_ready(0, min_depth):
-                    can_a, _, _ = self.account_a.can_trade()
-                    can_b, _, _ = self.account_b.can_trade()
-                    if can_a and can_b:
-                        self.burst_rounds += 1
-                        # TG: 冲刺模式首次触发时通知
-                        if self.burst_rounds == 1 and not self._burst_notified:
-                            self._burst_notified = True
-                            bbo = self.observer.current_bbo
-                            await self.tg.notify_burst(
-                                self.observer.zero_spread_duration_ms,
-                                bbo["bid_size"], bbo["ask_size"],
-                            )
-                        logger.info(f"🔥 冲刺连续开仓 (第 {self.burst_rounds} 轮)")
-                        await self._open_both()
-                        return  # state 已在 _open_both 中设为 HOLDING 或 IDLE
+                # 冲刺时放宽条件: 只要当前仍是 0 差就行, 动态算单量
+                if self.observer.is_spread_ready(0):
+                    burst_size = self.observer.calc_safe_size()
+                    if burst_size > 0:
+                        can_a, _, _ = self.account_a.can_trade()
+                        can_b, _, _ = self.account_b.can_trade()
+                        if can_a and can_b:
+                            self.burst_rounds += 1
+                            # TG: 冲刺模式首次触发时通知
+                            if self.burst_rounds == 1 and not self._burst_notified:
+                                self._burst_notified = True
+                                bbo = self.observer.current_bbo
+                                await self.tg.notify_burst(
+                                    self.observer.zero_spread_duration_ms,
+                                    bbo["bid_size"], bbo["ask_size"],
+                                )
+                            logger.info(f"🔥 冲刺连续开仓 (第 {self.burst_rounds} 轮) | {burst_size} {COIN_SYMBOL}")
+                            await self._open_both(burst_size)
+                            return  # state 已在 _open_both 中设为 HOLDING 或 IDLE
 
             # 非冲刺 / 冲刺结束 → 回到 IDLE
             self.burst_rounds = 0
@@ -1092,12 +1159,13 @@ class DualAccountController:
             # state 保持 HOLDING, 下次循环会再尝试平仓
 
     async def _retry_close(self, name: str, account: AccountTrader, side: str) -> bool:
-        """重试平仓, 最多 3 次"""
+        """Retry a failed close up to 3 times using the stored position size."""
+        close_size = self.current_position_size
         for attempt in range(1, 4):
             try:
-                await account.place_order_async(side, ORDER_SIZE)
+                await account.place_order_async(side, close_size)
                 account.rate_limiter.record_order()
-                logger.info(f"[{name}] 重试平仓成功 (第{attempt}次)")
+                logger.info(f"[{name}] 重试平仓成功 (第{attempt}次) | {close_size} {COIN_SYMBOL}")
                 return True
             except Exception as e:
                 logger.error(f"[{name}] 重试平仓失败 (第{attempt}次): {e}")
@@ -1105,21 +1173,22 @@ class DualAccountController:
         return False
 
     def _on_close_success(self):
-        """平仓成功的公共收尾逻辑 (含重试成功)"""
+        """Common post-close bookkeeping (cycle count, PnL, direction flip)."""
         self.cycle_count += 1
         self.successful_cycles += 1
         price = self.observer.current_bbo["mid_price"]
-        self.pnl_tracker.record_cycle(price, ORDER_SIZE)
+        self.pnl_tracker.record_cycle(price, self.current_position_size)
         self.current_direction = (
             "A_SHORT" if self.current_direction == "A_LONG" else "A_LONG"
         )
         self.burst_rounds = 0
+        self.current_position_size = 0
         self.state = StrategyState.IDLE
 
-    # ────────────────── 辅助方法 ──────────────────
+    # ─── Helpers ───
 
     async def _update_balances(self):
-        """并行更新两个账户余额"""
+        """Fetch balances for both accounts in parallel."""
         bal_a, bal_b = await asyncio.gather(
             self.account_a.get_balance_async(),
             self.account_b.get_balance_async(),
@@ -1130,13 +1199,14 @@ class DualAccountController:
             self.account_b.current_balance = bal_b
 
     def _update_display(self):
-        """刷新终端固定面板"""
+        """Refresh the terminal monitoring panel."""
         bbo = self.observer.current_bbo
         now = time.time()
 
         ws_age = (now - bbo["last_update"]) * 1000 if bbo["last_update"] > 0 else 0
         elapsed = now - self.start_time if self.start_time else 0
         elapsed_min = elapsed / 60
+        elapsed_hr = elapsed / 3600
 
         pnl_a = self.account_a.get_pnl()
         pnl_b = self.account_b.get_pnl()
@@ -1146,39 +1216,74 @@ class DualAccountController:
         min_a, _, day_a = self.account_a.rate_limiter.get_counts()
         min_b, _, day_b = self.account_b.rate_limiter.get_counts()
 
-        dir_text = "A多B空" if self.current_direction == "A_LONG" else "A空B多"
-        mode_text = "🔥冲刺" if self.observer.mode == "burst" else "常态"
+        dir_text = f"{C.CYAN}A多B空{C.RST}" if self.current_direction == "A_LONG" else f"{C.PURPLE}A空B多{C.RST}"
         zero_ms = self.observer.zero_spread_duration_ms
+        zero_color = C.BGREEN if zero_ms > 0 else C.DIM
 
-        pnl_sign = "+" if pnl_total >= 0 else ""
+        # 动态单量
+        if self.state == StrategyState.HOLDING:
+            size_text = f"{C.BYELLOW}{self.current_position_size}{C.RST}"
+        else:
+            safe = self.observer.calc_safe_size()
+            size_text = f"{C.BCYAN}{safe}{C.RST}" if safe > 0 else f"{C.DIM}--{C.RST}"
+
+        # 运行时间格式
+        if elapsed_hr >= 1:
+            time_text = f"{elapsed_hr:.1f}h"
+        else:
+            time_text = f"{elapsed_min:.1f}m"
+
+        W = 74
+        BAR = f"{C.BCYAN}{'━' * W}{C.RST}"
 
         lines = [
-            "═" * 72,
-            f"  📊 Paradex 双账户对冲套利 v1 | {self.state.value} | {mode_text}",
-            "═" * 72,
-            f"  💰 BTC: ${bbo['mid_price']:,.0f}  |  "
-            f"价差: {bbo['spread']:.5f}%  |  0差: {zero_ms:.0f}ms",
-            f"  📈 深度: 买 {bbo['bid_size']:.4f}  |  "
-            f"卖 {bbo['ask_size']:.4f}  |  下次: {dir_text}",
-            f"  🅰️ A: ${self.account_a.current_balance:.2f} | "
-            f"PnL:{pnl_a:+.4f} | {min_a}/{MAX_ORDERS_PER_MINUTE}分 {day_a}/{MAX_ORDERS_PER_DAY}日",
-            f"  🅱️ B: ${self.account_b.current_balance:.2f} | "
-            f"PnL:{pnl_b:+.4f} | {min_b}/{MAX_ORDERS_PER_MINUTE}分 {day_b}/{MAX_ORDERS_PER_DAY}日",
-            f"  🔄 循环: {self.cycle_count}/{MAX_CYCLES} | "
-            f"成功:{self.successful_cycles} 失败:{self.failed_cycles} | 冲刺:{self.burst_rounds}轮",
-            f"  💵 合计: {pnl_sign}{pnl_total:.4f} U | "
-            f"量: ${stats['volume'] / 1000:.1f}K | 每万: ${stats['per_10k']:.4f}",
-            f"  ⏱️  WS:{ws_age:.0f}ms | "
-            f"近5:[{self.latency_tracker.format_recent()}]ms | 运行:{elapsed_min:.1f}分",
-            "═" * 72,
+            BAR,
+            f"  {C.BOLD}{C.BWHITE}PARADEX DUAL HEDGE{C.RST}"
+            f"  {C.state_badge(self.state.value)}"
+            f"  {C.mode_badge(self.observer.mode)}"
+            f"  {C.DIM}{MARKET}{C.RST}",
+            BAR,
+            # ── 行情 ──
+            f"  {C.BOLD}PRICE{C.RST}  {C.BWHITE}${bbo['mid_price']:,.2f}{C.RST}"
+            f"    {C.BOLD}SPREAD{C.RST}  {C.spread_color(bbo['spread'], ZERO_SPREAD_THRESHOLD)}"
+            f"    {C.BOLD}0-GAP{C.RST}  {zero_color}{zero_ms:.0f}ms{C.RST}",
+            f"  {C.BOLD}DEPTH{C.RST}  {C.CYAN}BID {bbo['bid_size']:.4f}{C.RST}"
+            f"   {C.PURPLE}ASK {bbo['ask_size']:.4f}{C.RST}"
+            f"    {C.BOLD}SIZE{C.RST}  {size_text}"
+            f"    {C.BOLD}NEXT{C.RST}  {dir_text}",
+            BAR,
+            # ── 账户 ──
+            f"  {C.BOLD}{C.CYAN}A{C.RST}"
+            f"  ${self.account_a.current_balance:>8.2f}"
+            f"  {C.pnl(pnl_a)}"
+            f"    {C.bar(min_a, MAX_ORDERS_PER_MINUTE, 8)} {min_a:>2}/{MAX_ORDERS_PER_MINUTE}m"
+            f"    {C.bar(day_a, MAX_ORDERS_PER_DAY, 8)} {day_a:>4}/{MAX_ORDERS_PER_DAY}d",
+            f"  {C.BOLD}{C.PURPLE}B{C.RST}"
+            f"  ${self.account_b.current_balance:>8.2f}"
+            f"  {C.pnl(pnl_b)}"
+            f"    {C.bar(min_b, MAX_ORDERS_PER_MINUTE, 8)} {min_b:>2}/{MAX_ORDERS_PER_MINUTE}m"
+            f"    {C.bar(day_b, MAX_ORDERS_PER_DAY, 8)} {day_b:>4}/{MAX_ORDERS_PER_DAY}d",
+            BAR,
+            # ── 统计 ──
+            f"  {C.BOLD}CYCLES{C.RST}  {C.BWHITE}{self.cycle_count}{C.RST}/{MAX_CYCLES}"
+            f"   {C.GREEN}✓{self.successful_cycles}{C.RST}"
+            f" {C.RED}✗{self.failed_cycles}{C.RST}"
+            f"   {C.BOLD}BURST{C.RST} {self.burst_rounds}"
+            f"    {C.BOLD}PnL{C.RST}  {C.pnl(pnl_total)} U",
+            f"  {C.BOLD}VOL{C.RST}  ${stats['volume'] / 1000:.1f}K"
+            f"   {C.BOLD}PER10K{C.RST}  {C.pnl(stats['per_10k'])}"
+            f"    {C.BOLD}WS{C.RST} {ws_age:.0f}ms"
+            f"   {C.BOLD}LAT{C.RST} [{self.latency_tracker.format_recent()}]"
+            f"   {C.DIM}{time_text}{C.RST}",
+            BAR,
         ]
 
         self.panel.update(lines)
 
-    # ────────────────── 关闭 ──────────────────
+    # ─── Shutdown ───
 
     async def shutdown(self):
-        """关闭策略, 输出最终统计"""
+        """Graceful shutdown: final stats, TG report, cleanup."""
         self.running = False
 
         # 关闭 BBO 数据记录器 (刷出剩余缓冲)
@@ -1241,13 +1346,10 @@ class DualAccountController:
         print("👋 已退出")
 
 
-# ==================== 币种选择菜单 ====================
+# ─── Coin Selection ───
 
 def select_coin() -> str:
-    """
-    启动时显示币种选择菜单，返回选定的币种 key (BTC / ETH / SOL)。
-    支持交互式选择 & 命令行参数 (--coin BTC) 两种方式。
-    """
+    """Interactive coin selector. Also accepts --coin BTC from CLI."""
     # 命令行参数: python3 dual_scalper.py --coin BTC
     if "--coin" in sys.argv:
         idx = sys.argv.index("--coin")
@@ -1261,49 +1363,55 @@ def select_coin() -> str:
 
     # 交互式菜单
     coins = list(COIN_PRESETS.keys())
+    BAR = f"{C.BCYAN}{'━' * 56}{C.RST}"
     print()
-    print("=" * 50)
-    print("  🪙  Paradex 双账户对冲套利 - 选择交易币种")
-    print("=" * 50)
+    print(BAR)
+    print(f"  {C.BOLD}{C.BWHITE}PARADEX DUAL HEDGE{C.RST}  {C.DIM}Select Trading Pair{C.RST}")
+    print(BAR)
     for i, coin in enumerate(coins, 1):
         preset = COIN_PRESETS[coin]
-        print(f"  [{i}] {coin:<4}  →  {preset['market']:<20}  单量: {preset['order_size']}")
-    print("=" * 50)
+        print(f"  {C.BOLD}{C.BWHITE}[{i}]{C.RST}"
+              f"  {C.BCYAN}{coin:<4}{C.RST}"
+              f"  {C.DIM}→{C.RST}  {preset['market']:<18}"
+              f"  {C.DIM}size:{C.RST} {preset['order_size']}")
+    print(BAR)
 
     while True:
         try:
-            choice = input(f"请选择 (1-{len(coins)}): ").strip()
+            choice = input(f"\n  {C.BOLD}>{C.RST} ").strip()
             num = int(choice)
             if 1 <= num <= len(coins):
                 selected = coins[num - 1]
-                print(f"\n✅ 已选择: {selected} ({COIN_PRESETS[selected]['market']})\n")
+                print(f"\n  {C.BGREEN}✓{C.RST} {C.BOLD}{selected}{C.RST} {C.DIM}({COIN_PRESETS[selected]['market']}){C.RST}\n")
                 return selected
             else:
-                print(f"  ⚠️  请输入 1~{len(coins)} 之间的数字")
+                print(f"  {C.BYELLOW}!{C.RST} 输入 1~{len(coins)}")
         except ValueError:
-            # 也允许直接输入币种名称
             upper = choice.upper()
             if upper in COIN_PRESETS:
-                print(f"\n✅ 已选择: {upper} ({COIN_PRESETS[upper]['market']})\n")
+                print(f"\n  {C.BGREEN}✓{C.RST} {C.BOLD}{upper}{C.RST} {C.DIM}({COIN_PRESETS[upper]['market']}){C.RST}\n")
                 return upper
-            print(f"  ⚠️  无效输入，请输入数字 1~{len(coins)} 或币种名 ({'/'.join(coins)})")
+            print(f"  {C.BYELLOW}!{C.RST} 输入 1~{len(coins)} 或 {'/'.join(coins)}")
         except (EOFError, KeyboardInterrupt):
-            print("\n⏹️  已取消")
+            print(f"\n  {C.DIM}cancelled{C.RST}")
             sys.exit(0)
 
 
 def apply_coin_preset(coin: str):
-    """根据选定的币种覆盖全局运行变量"""
-    global MARKET, ORDER_SIZE, BURST_MIN_DEPTH, COIN_SYMBOL
+    """Override runtime globals with the selected coin's preset."""
+    global MARKET, ORDER_SIZE, MIN_ORDER_SIZE, SIZE_DECIMALS
+    global BURST_MIN_DEPTH, COIN_SYMBOL
 
     preset = COIN_PRESETS[coin]
     COIN_SYMBOL = coin
     MARKET = preset["market"]
     ORDER_SIZE = preset["order_size"]
+    MIN_ORDER_SIZE = preset["min_order_size"]
+    SIZE_DECIMALS = preset["size_decimals"]
     BURST_MIN_DEPTH = preset["burst_min_depth"]
 
 
-# ==================== 入口 ====================
+# ─── Entry Point ───
 
 async def main():
     controller = DualAccountController()

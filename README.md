@@ -1,63 +1,70 @@
-# Paradex BTC 秒开关策略
+# Paradex 双账户可选多币种对冲脚本
 
-纯 Python 后台 BTC 秒开秒关策略，使用 Paradex Retail Profile 免费交易。
+双账户 RPI 负点差对冲套利，零手续费刷量。
 
-## 策略逻辑
+## 原理
 
-1. 监控 BTC-USD-PERP 价差
-2. 当价差 ≤ 0.0006% 时：
-   - 开仓 (市价买入 0.006 BTC)
-   - 立即平仓 (市价卖出 0.006 BTC)
-3. 每个循环间隔 1 秒
-4. 完成 500 个循环后自动停止
+Paradex 的 Retail Profile 提供 0% maker/taker 费率。当 orderbook 出现 0 点差时，做市商的 RPI (Retail Price Improvement) 会提供比可见盘口更优的成交价，产生"负点差"。
 
-## 特点
+本策略用两个账户同时开反向仓位（一多一空），利用 RPI 实现超低磨损甚至正收益的刷量循环。
 
-- ✅ **免手续费**: 使用 Retail Profile，0% maker/taker 费用
-- ✅ **纯后台运行**: 无需浏览器，无需 Tampermonkey
-- ✅ **L2-Only 认证**: 只需 Starknet 私钥，更安全
-- ⚠️ **500ms 延迟**: Retail 模式有 speed bump
+## 工作流程
+
+```
+监控 BBO → 检测 0 差窗口 → 动态算单量 → 双账户反向开仓
+    ↑                                          ↓
+  交替方向 ← 回到 IDLE ← 检测 0 差窗口 ← 双账户同时平仓
+```
+
+- **动态单量**：根据盘口薄边深度自动调整，不穿透 orderbook
+- **冲刺模式**：检测到持续 0 差 + 厚深度时自动加速循环
+- **多币种**：启动时选择 BTC / ETH / SOL
+
+## 限制
+
+| 约束 | 值 |
+|------|------|
+| Retail 费率 | 0% maker / 0% taker |
+| Speed Bump | ~500ms |
+| 下单频率 | 30/min · 300/hr · 1000/day (每账户) |
 
 ## 快速开始
 
-### 1. 安装依赖
-
 ```bash
+# 安装
 pip install -r requirements.txt
+
+# 配置密钥
+# 编辑 config.py，填入两个账户的 L2 地址和私钥
+
+# 运行
+python3 dual_scalper.py
+
+# 指定币种跳过菜单
+python3 dual_scalper.py --coin ETH
 ```
 
-### 2. 配置 API 密钥
+## 文件结构
 
-编辑 `config.py`，填入你的 L2 地址和私钥：
-
-```python
-L2_ADDRESS = "0x你的L2地址"
-L2_PRIVATE_KEY = "0x你的L2私钥"
-```
-
-**获取方式**: 在 Paradex 网页端导出 Subkey
-
-### 3. 运行
-
-双击 `启动.bat` 或命令行运行：
-
-```bash
-python scalper.py
-```
-
-## 配置参数
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `ORDER_SIZE_BTC` | 0.006 | 每单大小 |
-| `MAX_SPREAD_PERCENT` | 0.0006 | 价差阈值 (%) |
-| `MAX_CYCLES` | 500 | 最大循环次数 |
-| `CYCLE_INTERVAL_SEC` | 1.0 | 循环间隔 (秒) |
+| 文件 | 用途 |
+|------|------|
+| `dual_scalper.py` | 主策略脚本 |
+| `config.py` | 所有配置参数 |
+| `bbo_analysis.py` | BBO 数据离线分析 |
+| `scalper.py` | 旧版单账户脚本 (参考) |
 
 ## 紧急停止
 
-在脚本目录创建名为 `STOP` 的文件即可停止运行。
+创建 `STOP` 文件即可停止：
 
-## 日志
+```bash
+touch STOP
+```
 
-运行日志保存在 `scalper.log`。
+## 数据分析
+
+脚本运行时自动记录 BBO 到 `bbo_data/` 目录，用分析脚本查看 0 差规律：
+
+```bash
+python3 bbo_analysis.py bbo_data/2026-02-09.csv
+```

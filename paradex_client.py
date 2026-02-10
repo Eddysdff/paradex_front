@@ -1,13 +1,3 @@
-"""
-Paradex API 客户端封装 (L2-Only 认证)
-
-功能:
-1. 使用 L2 私钥进行认证 (ParadexSubkey)
-2. 获取 BBO 数据
-3. 下市价单
-4. 获取持仓信息
-"""
-
 import asyncio
 import logging
 from decimal import Decimal

@@ -1,0 +1,19 @@
+# BBO 数据文件
+bbo_data/
+
+# 日志
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 环境
+.env
+venv/
+
+# 紧急停止文件
+STOP
+
+bbo_analysis.py
