@@ -14,17 +14,37 @@ L2_PRIVATE_KEY = ""
 API_BASE_URL = "https://api.prod.paradex.trade"
 WS_URL = "wss://ws.api.prod.paradex.trade/v1"
 
-# ==================== 交易配置 ====================
-MARKET = "ETH-USD-PERP"
+# ==================== 币种预设 ====================
+# 启动时选择币种，自动应用对应配置
+COIN_PRESETS = {
+    "BTC": {
+        "market": "BTC-USD-PERP",
+        "order_size": 0.004,       # BTC: 建议 0.004~0.01
+        "burst_min_depth": 0.03,   # 冲刺模式最低双边深度
+    },
+    "ETH": {
+        "market": "ETH-USD-PERP",
+        "order_size": 0.1,         # ETH: 建议 0.05~0.2
+        "burst_min_depth": 1,      # 冲刺模式最低双边深度
+    },
+    "SOL": {
+        "market": "SOL-USD-PERP",
+        "order_size": 2.0,         # SOL: 建议 1~5
+        "burst_min_depth": 20,     # 冲刺模式最低双边深度
+    },
+}
 
-# 每单大小 (根据 MARKET 调整)
-# BTC-USD-PERP: 建议 0.006~0.01
-# ETH-USD-PERP: 建议 0.05~0.2
-ORDER_SIZE_ETH = 0.1
+# ==================== 交易配置 ====================
+# 默认币种 (会被启动菜单覆盖)
+DEFAULT_COIN = "ETH"
+
+# 以下变量根据选定币种自动设置 (也可手动覆盖)
+MARKET = COIN_PRESETS[DEFAULT_COIN]["market"]
+ORDER_SIZE = COIN_PRESETS[DEFAULT_COIN]["order_size"]
 
 # 价差阈值 (百分比)
 # 当价差 <= 此值时触发开仓
-MAX_SPREAD_PERCENT = 0.001  # 0.0006%
+MAX_SPREAD_PERCENT = 0.0005  # 0.0005%
 
 # 最大循环次数 (一开一关为一个循环)
 # 每循环下2单，500循环 = 1000单 = Retail 24h 上限
@@ -56,7 +76,7 @@ ACCOUNT_B_L2_PRIVATE_KEY = ""
 
 # ==================== 对冲策略参数 ====================
 # 视为 "0 点差" 的阈值 (百分比)
-# Paradex 显示精度为 0.001%，低于此值视为 0 点差
+# Paradex 显示精度为 0.000%，低于0.0005%视为 0 点差
 ZERO_SPREAD_THRESHOLD = 0.001
 
 # 0 点差需持续多久才触发开/平仓 (毫秒)
@@ -66,15 +86,14 @@ ENTRY_ZERO_SPREAD_MS = 300
 MIN_DEPTH_MULTIPLIER = 2.0
 
 # 单轮最长持仓时间 (秒)，超时强制平仓
-MAX_HOLD_SECONDS = 30
+MAX_HOLD_SECONDS = 600
 
 # ==================== 冲刺模式配置 ====================
 # 0 点差持续多久判定为冲刺窗口 (毫秒)
 BURST_ZERO_SPREAD_MS = 2000
 
-# 冲刺模式最低双边深度
-# BTC: 建议 0.03  |  ETH: 建议 0.5
-BURST_MIN_DEPTH_ETH = 1
+# 冲刺模式最低双边深度 (根据选定币种自动设置)
+BURST_MIN_DEPTH = COIN_PRESETS[DEFAULT_COIN]["burst_min_depth"]
 
 # 每次冲刺窗口内最多连续循环数
 MAX_ROUNDS_PER_BURST = 5

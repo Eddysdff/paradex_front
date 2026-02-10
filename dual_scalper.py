@@ -26,17 +26,21 @@ from enum import Enum
 from typing import Optional, Dict, Any
 
 from config import (
-    MARKET, ORDER_SIZE_ETH, MAX_CYCLES, PARADEX_ENV,
+    COIN_PRESETS, DEFAULT_COIN,
+    MARKET, ORDER_SIZE, MAX_CYCLES, PARADEX_ENV,
     MAX_CONSECUTIVE_FAILURES, EMERGENCY_STOP_FILE,
     ACCOUNT_A_L2_ADDRESS, ACCOUNT_A_L2_PRIVATE_KEY,
     ACCOUNT_B_L2_ADDRESS, ACCOUNT_B_L2_PRIVATE_KEY,
     ZERO_SPREAD_THRESHOLD, ENTRY_ZERO_SPREAD_MS, MIN_DEPTH_MULTIPLIER,
     MAX_HOLD_SECONDS,
-    BURST_ZERO_SPREAD_MS, BURST_MIN_DEPTH_ETH,
+    BURST_ZERO_SPREAD_MS, BURST_MIN_DEPTH,
     MAX_ROUNDS_PER_BURST,
     TG_BOT_TOKEN, TG_CHAT_ID, TG_NOTIFY_INTERVAL, TG_ENABLED,
     BBO_RECORD_ENABLED, BBO_RECORD_DIR, BBO_RECORD_BUFFER_SIZE,
 )
+
+# 运行时覆盖的变量 (由 select_coin() 设置)
+COIN_SYMBOL = DEFAULT_COIN  # 当前选择的币种符号 (BTC / ETH / SOL)
 
 from paradex_py import ParadexSubkey
 from paradex_py.api.ws_client import ParadexWebsocketChannel
@@ -196,7 +200,7 @@ class TelegramNotifier:
         msg = (
             "🚀 <b>Paradex 双账户对冲套利已启动</b>\n"
             "\n"
-            f"📊 单量: {ORDER_SIZE_ETH} ETH\n"
+            f"📊 市场: {MARKET} | 单量: {ORDER_SIZE} {COIN_SYMBOL}\n"
             f"🚦 限速: {MAX_ORDERS_PER_MINUTE}/分 | {MAX_ORDERS_PER_DAY}/日 (每账户)\n"
             f"💰 A 余额: ${bal_a:.4f}\n"
             f"💰 B 余额: ${bal_b:.4f}\n"
@@ -438,8 +442,8 @@ class MarketObserver:
         bbo = self.current_bbo
 
         if (self.zero_spread_duration_ms >= BURST_ZERO_SPREAD_MS
-                and bbo["bid_size"] >= BURST_MIN_DEPTH_ETH
-                and bbo["ask_size"] >= BURST_MIN_DEPTH_ETH):
+                and bbo["bid_size"] >= BURST_MIN_DEPTH
+                and bbo["ask_size"] >= BURST_MIN_DEPTH):
             if self.mode != "burst":
                 logger.info(
                     f"🔥 进入冲刺模式! 0差持续 {self.zero_spread_duration_ms:.0f}ms, "
@@ -687,13 +691,13 @@ class DualAccountController:
 
     async def start(self):
         print("=" * 72)
-        print("🚀 Paradex BTC 双账户对冲套利 v1 - RPI 负点差套利版")
+        print(f"🚀 Paradex {COIN_SYMBOL} 双账户对冲套利 v1 - RPI 负点差套利版")
         print("=" * 72)
-        print(f"📊 单量: {ORDER_SIZE_ETH} ETH | 最大循环: {MAX_CYCLES}")
+        print(f"📊 市场: {MARKET} | 单量: {ORDER_SIZE} {COIN_SYMBOL} | 最大循环: {MAX_CYCLES}")
         print(f"⏱️  触发: 0差≥{ENTRY_ZERO_SPREAD_MS}ms | "
-              f"深度≥{ORDER_SIZE_ETH * MIN_DEPTH_MULTIPLIER:.3f} ETH")
+              f"深度≥{ORDER_SIZE * MIN_DEPTH_MULTIPLIER:.3f} {COIN_SYMBOL}")
         print(f"🔥 冲刺: 0差≥{BURST_ZERO_SPREAD_MS}ms | "
-              f"深度≥{BURST_MIN_DEPTH_ETH} ETH | 每窗口≤{MAX_ROUNDS_PER_BURST}轮")
+              f"深度≥{BURST_MIN_DEPTH} {COIN_SYMBOL} | 每窗口≤{MAX_ROUNDS_PER_BURST}轮")
         print(f"🚦 限速: {MAX_ORDERS_PER_MINUTE}/分 | "
               f"{MAX_ORDERS_PER_HOUR}/时 | {MAX_ORDERS_PER_DAY}/24h (每账户)")
         print("=" * 72)
@@ -857,7 +861,7 @@ class DualAccountController:
 
     async def _handle_idle(self):
         """IDLE: 等待 0 点差窗口开仓"""
-        min_depth = ORDER_SIZE_ETH * MIN_DEPTH_MULTIPLIER
+        min_depth = ORDER_SIZE * MIN_DEPTH_MULTIPLIER
 
         if not self.observer.is_entry_ready(ENTRY_ZERO_SPREAD_MS, min_depth):
             return
@@ -880,7 +884,7 @@ class DualAccountController:
             return
 
         # 平仓条件比开仓宽松: 0 差等待时间减半
-        min_depth = ORDER_SIZE_ETH * MIN_DEPTH_MULTIPLIER
+        min_depth = ORDER_SIZE * MIN_DEPTH_MULTIPLIER
         exit_min_ms = ENTRY_ZERO_SPREAD_MS / 2
 
         if not self.observer.is_entry_ready(exit_min_ms, min_depth):
@@ -906,12 +910,12 @@ class DualAccountController:
             a_side, b_side = "SELL", "BUY"
 
         dir_text = "A多B空" if self.current_direction == "A_LONG" else "A空B多"
-        logger.info(f"开仓: {dir_text} | {ORDER_SIZE_ETH} ETH")
+        logger.info(f"开仓: {dir_text} | {ORDER_SIZE} {COIN_SYMBOL}")
 
         # 并行下单 (asyncio.to_thread 让两个 HTTP 同时发出)
         results = await asyncio.gather(
-            self.account_a.place_order_async(a_side, ORDER_SIZE_ETH),
-            self.account_b.place_order_async(b_side, ORDER_SIZE_ETH),
+            self.account_a.place_order_async(a_side, ORDER_SIZE),
+            self.account_b.place_order_async(b_side, ORDER_SIZE),
             return_exceptions=True,
         )
 
@@ -935,7 +939,7 @@ class DualAccountController:
             self.account_a.rate_limiter.record_order()
             try:
                 reverse = "SELL" if a_side == "BUY" else "BUY"
-                await self.account_a.place_order_async(reverse, ORDER_SIZE_ETH)
+                await self.account_a.place_order_async(reverse, ORDER_SIZE)
                 self.account_a.rate_limiter.record_order()
                 logger.info("[A] 回撤成功")
             except Exception as e:
@@ -950,7 +954,7 @@ class DualAccountController:
             self.account_b.rate_limiter.record_order()
             try:
                 reverse = "BUY" if b_side == "SELL" else "SELL"
-                await self.account_b.place_order_async(reverse, ORDER_SIZE_ETH)
+                await self.account_b.place_order_async(reverse, ORDER_SIZE)
                 self.account_b.rate_limiter.record_order()
                 logger.info("[B] 回撤成功")
             except Exception as e:
@@ -981,8 +985,8 @@ class DualAccountController:
 
         # 并行平仓
         results = await asyncio.gather(
-            self.account_a.place_order_async(a_side, ORDER_SIZE_ETH),
-            self.account_b.place_order_async(b_side, ORDER_SIZE_ETH),
+            self.account_a.place_order_async(a_side, ORDER_SIZE),
+            self.account_b.place_order_async(b_side, ORDER_SIZE),
             return_exceptions=True,
         )
 
@@ -1002,7 +1006,7 @@ class DualAccountController:
 
             # 记录成交量 & 延迟
             price = self.observer.current_bbo["mid_price"]
-            self.pnl_tracker.record_cycle(price, ORDER_SIZE_ETH)
+            self.pnl_tracker.record_cycle(price, ORDER_SIZE)
             latency_ms = (time.time() - cycle_start) * 1000
             self.latency_tracker.record_cycle_latency(latency_ms)
             logger.info(f"✅ 循环 {self.cycle_count} 完成 | {latency_ms:.0f}ms")
@@ -1032,7 +1036,7 @@ class DualAccountController:
                     and self.cycle_count < MAX_CYCLES
                     and not emergency):
 
-                min_depth = ORDER_SIZE_ETH * MIN_DEPTH_MULTIPLIER
+                min_depth = ORDER_SIZE * MIN_DEPTH_MULTIPLIER
 
                 # 冲刺时放宽条件: 只要当前仍是 0 差 + 深度够就行
                 if self.observer.is_entry_ready(0, min_depth):
@@ -1091,7 +1095,7 @@ class DualAccountController:
         """重试平仓, 最多 3 次"""
         for attempt in range(1, 4):
             try:
-                await account.place_order_async(side, ORDER_SIZE_ETH)
+                await account.place_order_async(side, ORDER_SIZE)
                 account.rate_limiter.record_order()
                 logger.info(f"[{name}] 重试平仓成功 (第{attempt}次)")
                 return True
@@ -1105,7 +1109,7 @@ class DualAccountController:
         self.cycle_count += 1
         self.successful_cycles += 1
         price = self.observer.current_bbo["mid_price"]
-        self.pnl_tracker.record_cycle(price, ORDER_SIZE_ETH)
+        self.pnl_tracker.record_cycle(price, ORDER_SIZE)
         self.current_direction = (
             "A_SHORT" if self.current_direction == "A_LONG" else "A_LONG"
         )
@@ -1237,7 +1241,70 @@ class DualAccountController:
         print("👋 已退出")
 
 
+# ==================== 币种选择菜单 ====================
+
+def select_coin() -> str:
+    """
+    启动时显示币种选择菜单，返回选定的币种 key (BTC / ETH / SOL)。
+    支持交互式选择 & 命令行参数 (--coin BTC) 两种方式。
+    """
+    # 命令行参数: python3 dual_scalper.py --coin BTC
+    if "--coin" in sys.argv:
+        idx = sys.argv.index("--coin")
+        if idx + 1 < len(sys.argv):
+            coin = sys.argv[idx + 1].upper()
+            if coin in COIN_PRESETS:
+                return coin
+            else:
+                print(f"❌ 无效币种: {coin}，可选: {', '.join(COIN_PRESETS.keys())}")
+                sys.exit(1)
+
+    # 交互式菜单
+    coins = list(COIN_PRESETS.keys())
+    print()
+    print("=" * 50)
+    print("  🪙  Paradex 双账户对冲套利 - 选择交易币种")
+    print("=" * 50)
+    for i, coin in enumerate(coins, 1):
+        preset = COIN_PRESETS[coin]
+        print(f"  [{i}] {coin:<4}  →  {preset['market']:<20}  单量: {preset['order_size']}")
+    print("=" * 50)
+
+    while True:
+        try:
+            choice = input(f"请选择 (1-{len(coins)}): ").strip()
+            num = int(choice)
+            if 1 <= num <= len(coins):
+                selected = coins[num - 1]
+                print(f"\n✅ 已选择: {selected} ({COIN_PRESETS[selected]['market']})\n")
+                return selected
+            else:
+                print(f"  ⚠️  请输入 1~{len(coins)} 之间的数字")
+        except ValueError:
+            # 也允许直接输入币种名称
+            upper = choice.upper()
+            if upper in COIN_PRESETS:
+                print(f"\n✅ 已选择: {upper} ({COIN_PRESETS[upper]['market']})\n")
+                return upper
+            print(f"  ⚠️  无效输入，请输入数字 1~{len(coins)} 或币种名 ({'/'.join(coins)})")
+        except (EOFError, KeyboardInterrupt):
+            print("\n⏹️  已取消")
+            sys.exit(0)
+
+
+def apply_coin_preset(coin: str):
+    """根据选定的币种覆盖全局运行变量"""
+    global MARKET, ORDER_SIZE, BURST_MIN_DEPTH, COIN_SYMBOL
+
+    preset = COIN_PRESETS[coin]
+    COIN_SYMBOL = coin
+    MARKET = preset["market"]
+    ORDER_SIZE = preset["order_size"]
+    BURST_MIN_DEPTH = preset["burst_min_depth"]
+
+
 # ==================== 入口 ====================
+
 async def main():
     controller = DualAccountController()
     await controller.start()
@@ -1245,6 +1312,11 @@ async def main():
 
 if __name__ == "__main__":
     try:
+        # 1. 选择币种
+        selected_coin = select_coin()
+        # 2. 应用预设
+        apply_coin_preset(selected_coin)
+        # 3. 启动策略
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n⏹️  已中断")
