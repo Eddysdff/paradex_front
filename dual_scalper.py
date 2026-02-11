@@ -54,7 +54,7 @@ logging.getLogger('paradex_py').setLevel(logging.WARNING)
 
 # ─── Rate limits (Retail profile) ───
 MAX_ORDERS_PER_MINUTE = 30
-MAX_ORDERS_PER_HOUR = 300
+MAX_ORDERS_PER_HALF_HOUR = 300
 MAX_ORDERS_PER_DAY = 1000
 
 
@@ -66,29 +66,29 @@ class StrategyState(Enum):
 
 # ─── Rate Limiter ───
 class RateLimiter:
-    """Sliding-window rate limiter (minute / hour / day)."""
+    """Sliding-window rate limiter (minute / 30min / day)."""
 
-    def __init__(self, per_minute: int, per_hour: int, per_day: int):
+    def __init__(self, per_minute: int, per_half_hour: int, per_day: int):
         self.per_minute = per_minute
-        self.per_hour = per_hour
+        self.per_half_hour = per_half_hour
         self.per_day = per_day
         self.minute_orders: deque = deque()
-        self.hour_orders: deque = deque()
+        self.half_hour_orders: deque = deque()
         self.day_orders: deque = deque()
 
     def can_place_order(self) -> tuple[bool, float, str]:
         now = time.time()
         while self.minute_orders and now - self.minute_orders[0] > 60:
             self.minute_orders.popleft()
-        while self.hour_orders and now - self.hour_orders[0] > 3600:
-            self.hour_orders.popleft()
+        while self.half_hour_orders and now - self.half_hour_orders[0] > 1800:
+            self.half_hour_orders.popleft()
         while self.day_orders and now - self.day_orders[0] > 86400:
             self.day_orders.popleft()
 
         if len(self.minute_orders) >= self.per_minute:
             return False, 60 - (now - self.minute_orders[0]), "分钟"
-        if len(self.hour_orders) >= self.per_hour:
-            return False, 3600 - (now - self.hour_orders[0]), "小时"
+        if len(self.half_hour_orders) >= self.per_half_hour:
+            return False, 1800 - (now - self.half_hour_orders[0]), "30分钟"
         if len(self.day_orders) >= self.per_day:
             return False, 86400 - (now - self.day_orders[0]), "24h"
         return True, 0, ""
@@ -96,11 +96,12 @@ class RateLimiter:
     def record_order(self):
         now = time.time()
         self.minute_orders.append(now)
-        self.hour_orders.append(now)
+        self.half_hour_orders.append(now)
         self.day_orders.append(now)
 
     def get_counts(self) -> tuple[int, int, int]:
-        return len(self.minute_orders), len(self.hour_orders), len(self.day_orders)
+        """Returns (minute_count, half_hour_count, day_count)."""
+        return len(self.minute_orders), len(self.half_hour_orders), len(self.day_orders)
 
 
 # ─── Latency Tracker ───
@@ -137,19 +138,37 @@ class LatencyTracker:
 
 # ─── Telegram Notifier ───
 class TelegramNotifier:
-    """Async Telegram alerts via stdlib urllib. Non-blocking, fail-safe."""
+    """Async Telegram alerts + /stop command listener via stdlib urllib."""
 
     def __init__(self, bot_token: str, chat_id: str, enabled: bool = True):
         self.bot_token = bot_token
         self.chat_id = chat_id
         self.enabled = enabled and bool(bot_token) and bool(chat_id)
+        self._stop_requested = False
+        self._last_update_id = 0
         if self.enabled:
             logger.info("Telegram 通知已启用")
+            self._init_update_offset()
         else:
             logger.info("Telegram 通知未启用 (未配置 Token/ChatID 或已关闭)")
 
+    def _init_update_offset(self):
+        """Skip all pending updates on startup to avoid stale /stop commands."""
+        try:
+            import urllib.request
+            import json
+            url = (f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
+                   f"?offset=-1&limit=1&timeout=0")
+            req = urllib.request.Request(url)
+            resp = urllib.request.urlopen(req, timeout=5)
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("ok") and data.get("result"):
+                self._last_update_id = data["result"][-1]["update_id"] + 1
+        except Exception as e:
+            logger.debug(f"TG init offset failed (non-critical): {e}")
+
     def _send_sync(self, text: str):
-        """同步发送 (在线程中调用)"""
+        """Blocking send (runs in thread pool)."""
         import urllib.request
         import json
 
@@ -166,8 +185,59 @@ class TelegramNotifier:
         )
         urllib.request.urlopen(req, timeout=10)
 
+    def _poll_commands_sync(self) -> list[str]:
+        """Blocking poll for new commands from the authorized chat."""
+        import urllib.request
+        import json
+
+        url = (f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
+               f"?offset={self._last_update_id}&limit=10&timeout=0")
+        req = urllib.request.Request(url)
+        resp = urllib.request.urlopen(req, timeout=5)
+        data = json.loads(resp.read().decode("utf-8"))
+
+        commands = []
+        if data.get("ok"):
+            for update in data.get("result", []):
+                self._last_update_id = update["update_id"] + 1
+                msg = update.get("message", {})
+                # Only accept commands from the authorized chat
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                text = msg.get("text", "").strip().lower()
+                if chat_id == str(self.chat_id) and text.startswith("/"):
+                    commands.append(text)
+        return commands
+
+    async def poll_commands(self) -> list[str]:
+        """Async poll for TG commands. Returns list of command strings."""
+        if not self.enabled:
+            return []
+        try:
+            return await asyncio.to_thread(self._poll_commands_sync)
+        except Exception as e:
+            logger.debug(f"TG poll failed (non-critical): {e}")
+            return []
+
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop_requested
+
+    async def check_stop(self) -> bool:
+        """Poll TG and check if /stop was received. Returns True if stop requested."""
+        commands = await self.poll_commands()
+        for cmd in commands:
+            if cmd in ("/stop", "/stop@" + self.bot_token.split(":")[0]):
+                self._stop_requested = True
+                logger.info("收到 Telegram /stop 指令")
+                await self.send("🛑 <b>收到 /stop 指令, 正在安全停止...</b>")
+                return True
+            elif cmd == "/status":
+                # Bonus: /status returns a quick ack
+                await self.send("✅ 脚本运行中")
+        return False
+
     async def send(self, text: str):
-        """异步发送, 失败不抛异常"""
+        """Async send, swallows exceptions."""
         if not self.enabled:
             return
         try:
@@ -181,10 +251,12 @@ class TelegramNotifier:
             "🚀 <b>Paradex 双账户对冲套利已启动</b>\n"
             "\n"
             f"📊 市场: {MARKET} | 最大单量: {ORDER_SIZE} {COIN_SYMBOL} (动态)\n"
-            f"🚦 限速: {MAX_ORDERS_PER_MINUTE}/分 | {MAX_ORDERS_PER_DAY}/日 (每账户)\n"
+            f"🚦 限速: {MAX_ORDERS_PER_MINUTE}/分 | {MAX_ORDERS_PER_HALF_HOUR}/30分 | {MAX_ORDERS_PER_DAY}/日 (每账户)\n"
             f"💰 A 余额: ${bal_a:.4f}\n"
             f"💰 B 余额: ${bal_b:.4f}\n"
             f"💰 合计: ${bal_a + bal_b:.4f}\n"
+            "\n"
+            f"📡 发送 /stop 可远程停止脚本\n"
         )
         await self.send(msg)
 
@@ -194,8 +266,8 @@ class TelegramNotifier:
         """周期性进度报告"""
         pnl_a = account_a.get_pnl()
         pnl_b = account_b.get_pnl()
-        _, _, day_a = account_a.rate_limiter.get_counts()
-        _, _, day_b = account_b.rate_limiter.get_counts()
+        _, half_a, day_a = account_a.rate_limiter.get_counts()
+        _, half_b, day_b = account_b.rate_limiter.get_counts()
 
         pnl_emoji = "📈" if stats['pnl_total'] >= 0 else "📉"
 
@@ -207,8 +279,8 @@ class TelegramNotifier:
             f"{pnl_emoji} 合计盈亏: ${stats['pnl_total']:+.4f}\n"
             f"📊 每万收益: ${stats['per_10k']:.4f}\n"
             "\n"
-            f"🅰️ A: PnL ${pnl_a:+.4f} | 24h单数: {day_a}/{MAX_ORDERS_PER_DAY}\n"
-            f"🅱️ B: PnL ${pnl_b:+.4f} | 24h单数: {day_b}/{MAX_ORDERS_PER_DAY}\n"
+            f"🅰️ A: PnL ${pnl_a:+.4f} | 30m: {half_a}/{MAX_ORDERS_PER_HALF_HOUR} | 24h: {day_a}/{MAX_ORDERS_PER_DAY}\n"
+            f"🅱️ B: PnL ${pnl_b:+.4f} | 30m: {half_b}/{MAX_ORDERS_PER_HALF_HOUR} | 24h: {day_b}/{MAX_ORDERS_PER_DAY}\n"
             f"⏰ 运行: {elapsed_min:.1f} 分钟\n"
         )
         await self.send(msg)
@@ -475,7 +547,7 @@ class AccountTrader:
         self.l2_address = l2_address
         self.l2_private_key = l2_private_key
         self.paradex: Optional[ParadexSubkey] = None
-        self.rate_limiter = RateLimiter(MAX_ORDERS_PER_MINUTE, MAX_ORDERS_PER_HOUR, MAX_ORDERS_PER_DAY)
+        self.rate_limiter = RateLimiter(MAX_ORDERS_PER_MINUTE, MAX_ORDERS_PER_HALF_HOUR, MAX_ORDERS_PER_DAY)
         self.last_auth_time: float = 0
         self.initial_balance: float = 0.0
         self.current_balance: float = 0.0
@@ -757,7 +829,7 @@ class DualAccountController:
               f"    {C.BOLD}DEPTH{C.RST}   ≥{BURST_MIN_DEPTH} {COIN_SYMBOL}"
               f"    {C.BOLD}MAX{C.RST}  {MAX_ROUNDS_PER_BURST} rounds")
         print(f"  {C.BOLD}RATE{C.RST}    {MAX_ORDERS_PER_MINUTE}/min"
-              f"  {MAX_ORDERS_PER_HOUR}/hr"
+              f"  {MAX_ORDERS_PER_HALF_HOUR}/30min"
               f"  {MAX_ORDERS_PER_DAY}/day {C.DIM}(per account){C.RST}")
         print(BAR)
         print()
@@ -869,8 +941,19 @@ class DualAccountController:
 
     async def main_loop(self):
         last_balance_check: float = 0
+        last_tg_poll: float = 0
 
         while self.running and self.cycle_count < MAX_CYCLES:
+            # ── Telegram /stop 检查 (每 3 秒轮询一次) ──
+            now = time.time()
+            if now - last_tg_poll > 3:
+                last_tg_poll = now
+                if await self.tg.check_stop():
+                    logger.info("Telegram /stop 指令触发停止")
+                    stats = self.pnl_tracker.get_stats(self.account_a, self.account_b)
+                    await self.tg.notify_error("Telegram /stop 指令", stats)
+                    break
+
             # 安全检查
             if os.path.exists(EMERGENCY_STOP_FILE):
                 logger.info("检测到紧急停止文件, 退出")
@@ -1216,8 +1299,8 @@ class DualAccountController:
         pnl_total = pnl_a + pnl_b
         stats = self.pnl_tracker.get_stats(self.account_a, self.account_b)
 
-        min_a, _, day_a = self.account_a.rate_limiter.get_counts()
-        min_b, _, day_b = self.account_b.rate_limiter.get_counts()
+        min_a, half_a, day_a = self.account_a.rate_limiter.get_counts()
+        min_b, half_b, day_b = self.account_b.rate_limiter.get_counts()
 
         dir_text = f"{C.CYAN}A多B空{C.RST}" if self.current_direction == "A_LONG" else f"{C.PURPLE}A空B多{C.RST}"
         zero_ms = self.observer.zero_spread_duration_ms
@@ -1259,13 +1342,15 @@ class DualAccountController:
             f"  {C.BOLD}{C.CYAN}A{C.RST}"
             f"  ${self.account_a.current_balance:>8.2f}"
             f"  {C.pnl(pnl_a)}"
-            f"    {C.bar(min_a, MAX_ORDERS_PER_MINUTE, 8)} {min_a:>2}/{MAX_ORDERS_PER_MINUTE}m"
-            f"    {C.bar(day_a, MAX_ORDERS_PER_DAY, 8)} {day_a:>4}/{MAX_ORDERS_PER_DAY}d",
+            f"  {C.bar(min_a, MAX_ORDERS_PER_MINUTE, 6)} {min_a:>2}/{MAX_ORDERS_PER_MINUTE}m"
+            f"  {C.bar(half_a, MAX_ORDERS_PER_HALF_HOUR, 6)} {half_a:>3}/{MAX_ORDERS_PER_HALF_HOUR}h"
+            f"  {C.bar(day_a, MAX_ORDERS_PER_DAY, 6)} {day_a:>4}/{MAX_ORDERS_PER_DAY}d",
             f"  {C.BOLD}{C.PURPLE}B{C.RST}"
             f"  ${self.account_b.current_balance:>8.2f}"
             f"  {C.pnl(pnl_b)}"
-            f"    {C.bar(min_b, MAX_ORDERS_PER_MINUTE, 8)} {min_b:>2}/{MAX_ORDERS_PER_MINUTE}m"
-            f"    {C.bar(day_b, MAX_ORDERS_PER_DAY, 8)} {day_b:>4}/{MAX_ORDERS_PER_DAY}d",
+            f"  {C.bar(min_b, MAX_ORDERS_PER_MINUTE, 6)} {min_b:>2}/{MAX_ORDERS_PER_MINUTE}m"
+            f"  {C.bar(half_b, MAX_ORDERS_PER_HALF_HOUR, 6)} {half_b:>3}/{MAX_ORDERS_PER_HALF_HOUR}h"
+            f"  {C.bar(day_b, MAX_ORDERS_PER_DAY, 6)} {day_b:>4}/{MAX_ORDERS_PER_DAY}d",
             BAR,
             # ── 统计 ──
             f"  {C.BOLD}CYCLES{C.RST}  {C.BWHITE}{self.cycle_count}{C.RST}/{MAX_CYCLES}"
