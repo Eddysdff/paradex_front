@@ -524,14 +524,17 @@ class AccountTrader:
 
     def _place_order_sync(self, side: str, size: float) -> dict:
         """Blocking market order (runs in thread pool)."""
+        order_side = OrderSide.Buy if side == "BUY" else OrderSide.Sell
+        logger.info(f"[{self.name}] SUBMIT {side} {size} {MARKET} (OrderSide={order_side})")
         order = Order(
             market=MARKET,
             order_type=OrderType.Market,
-            order_side=OrderSide.Buy if side == "BUY" else OrderSide.Sell,
+            order_side=order_side,
             size=Decimal(str(size)),
         )
         result = self.paradex.api_client.submit_order(order)
         self.order_count += 1
+        logger.info(f"[{self.name}] FILLED {side} {size} — result: {result}")
         return result
 
     async def place_order_async(self, side: str, size: float) -> dict:

@@ -58,7 +58,7 @@ ACCOUNT_B_L2_PRIVATE_KEY = ""
 
 # ─── 策略参数 ───
 ZERO_SPREAD_THRESHOLD = 0.0005  # 低于此值视为 0 点差 (%)
-ENTRY_ZERO_SPREAD_MS = 100     # 0 差持续多久才开/平仓 (ms)
+ENTRY_ZERO_SPREAD_MS = 25     # 0 差持续多久才开/平仓 (ms)
 DEPTH_SAFETY_FACTOR = 0.8      # 取薄边深度的 80% 作为单量
 MAX_HOLD_SECONDS = 600         # 持仓超时强平 (秒)
 
