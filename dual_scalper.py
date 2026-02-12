@@ -486,8 +486,8 @@ class MarketObserver:
                 "last_update": now,
             }
 
-            # 追踪 0 点差持续时间 (低于阈值视为 0)
-            if spread_pct < ZERO_SPREAD_THRESHOLD:
+            # 追踪 0 点差持续时间 (≤ 阈值视为 0)
+            if spread_pct <= ZERO_SPREAD_THRESHOLD:
                 if self.zero_spread_start == 0:
                     self.zero_spread_start = now
                 self.zero_spread_duration_ms = (now - self.zero_spread_start) * 1000
@@ -533,8 +533,8 @@ class MarketObserver:
         if time.time() - bbo["last_update"] > 1.0:
             return False
 
-        # 必须 0 点差
-        if bbo["spread"] >= ZERO_SPREAD_THRESHOLD:
+        # 必须 0 点差 (≤ 阈值)
+        if bbo["spread"] > ZERO_SPREAD_THRESHOLD:
             return False
 
         # 0 点差持续 >= min_ms
