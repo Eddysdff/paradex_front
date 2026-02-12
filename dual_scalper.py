@@ -476,7 +476,7 @@ class MarketObserver:
                 return
 
             mid = (bid + ask) / 2
-            spread_pct = (ask - bid) / mid * 100
+            spread_pct = round((ask - bid) / mid * 100, 6)
             now = time.time()
 
             self.current_bbo = {
