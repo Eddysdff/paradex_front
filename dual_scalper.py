@@ -138,7 +138,7 @@ class LatencyTracker:
 
 # ─── Telegram Notifier ───
 class TelegramNotifier:
-    """Async Telegram alerts + /stop command listener via stdlib urllib."""
+    """Async Telegram alerts + background /stop command listener."""
 
     def __init__(self, bot_token: str, chat_id: str, enabled: bool = True):
         self.bot_token = bot_token
@@ -146,6 +146,8 @@ class TelegramNotifier:
         self.enabled = enabled and bool(bot_token) and bool(chat_id)
         self._stop_requested = False
         self._last_update_id = 0
+        self._poll_task: Optional[asyncio.Task] = None
+        self._poll_failures = 0
         if self.enabled:
             logger.info("Telegram 通知已启用")
             self._init_update_offset()
@@ -153,10 +155,21 @@ class TelegramNotifier:
             logger.info("Telegram 通知未启用 (未配置 Token/ChatID 或已关闭)")
 
     def _init_update_offset(self):
-        """Skip all pending updates on startup to avoid stale /stop commands."""
+        """Delete webhook (fixes 409) and skip stale updates on startup."""
+        import urllib.request
+        import json
+
+        # Step 1: Delete any existing webhook to avoid 409 conflict
         try:
-            import urllib.request
-            import json
+            url = f"https://api.telegram.org/bot{self.bot_token}/deleteWebhook"
+            req = urllib.request.Request(url)
+            urllib.request.urlopen(req, timeout=5)
+            logger.info("TG webhook cleared")
+        except Exception:
+            pass
+
+        # Step 2: Skip all pending updates
+        try:
             url = (f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
                    f"?offset=-1&limit=1&timeout=0")
             req = urllib.request.Request(url)
@@ -186,14 +199,14 @@ class TelegramNotifier:
         urllib.request.urlopen(req, timeout=10)
 
     def _poll_commands_sync(self) -> list[str]:
-        """Blocking poll for new commands from the authorized chat."""
+        """Blocking poll for new commands. Short timeout to minimize blocking."""
         import urllib.request
         import json
 
         url = (f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
                f"?offset={self._last_update_id}&limit=10&timeout=0")
         req = urllib.request.Request(url)
-        resp = urllib.request.urlopen(req, timeout=5)
+        resp = urllib.request.urlopen(req, timeout=3)
         data = json.loads(resp.read().decode("utf-8"))
 
         commands = []
@@ -201,40 +214,59 @@ class TelegramNotifier:
             for update in data.get("result", []):
                 self._last_update_id = update["update_id"] + 1
                 msg = update.get("message", {})
-                # Only accept commands from the authorized chat
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 text = msg.get("text", "").strip().lower()
                 if chat_id == str(self.chat_id) and text.startswith("/"):
                     commands.append(text)
         return commands
 
-    async def poll_commands(self) -> list[str]:
-        """Async poll for TG commands. Returns list of command strings."""
-        if not self.enabled:
-            return []
-        try:
-            return await asyncio.to_thread(self._poll_commands_sync)
-        except Exception as e:
-            logger.debug(f"TG poll failed (non-critical): {e}")
-            return []
-
     @property
     def stop_requested(self) -> bool:
         return self._stop_requested
 
-    async def check_stop(self) -> bool:
-        """Poll TG and check if /stop was received. Returns True if stop requested."""
-        commands = await self.poll_commands()
-        for cmd in commands:
-            if cmd in ("/stop", "/stop@" + self.bot_token.split(":")[0]):
-                self._stop_requested = True
-                logger.info("收到 Telegram /stop 指令")
-                await self.send("🛑 <b>收到 /stop 指令, 正在安全停止...</b>")
-                return True
-            elif cmd == "/status":
-                # Bonus: /status returns a quick ack
-                await self.send("✅ 脚本运行中")
-        return False
+    def start_polling(self):
+        """Start background task to poll TG commands. Non-blocking."""
+        if self.enabled and self._poll_task is None:
+            self._poll_task = asyncio.create_task(self._poll_loop())
+            logger.info("TG 指令轮询已启动 (后台)")
+
+    def stop_polling(self):
+        """Cancel the background polling task."""
+        if self._poll_task and not self._poll_task.done():
+            self._poll_task.cancel()
+
+    async def _poll_loop(self):
+        """Background loop: polls TG every 5s, backs off on repeated failures."""
+        poll_interval = 5
+        max_interval = 60
+
+        while True:
+            try:
+                await asyncio.sleep(poll_interval)
+                commands = await asyncio.to_thread(self._poll_commands_sync)
+                self._poll_failures = 0
+                poll_interval = 5  # Reset on success
+
+                for cmd in commands:
+                    if cmd.startswith("/stop"):
+                        self._stop_requested = True
+                        logger.info("收到 Telegram /stop 指令")
+                        await self.send("🛑 <b>收到 /stop 指令, 正在安全停止...</b>")
+                        return
+                    elif cmd == "/status":
+                        await self.send("✅ 脚本运行中")
+
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                self._poll_failures += 1
+                # Exponential backoff: 5 → 10 → 20 → 40 → 60 (cap)
+                poll_interval = min(5 * (2 ** self._poll_failures), max_interval)
+                if self._poll_failures <= 3:
+                    logger.debug(f"TG poll failed ({e}), retry in {poll_interval}s")
+                elif self._poll_failures == 4:
+                    logger.warning(f"TG poll 连续失败 {self._poll_failures} 次, "
+                                   f"降频至 {poll_interval}s 轮询")
 
     async def send(self, text: str):
         """Async send, swallows exceptions."""
@@ -569,8 +601,8 @@ class AccountTrader:
             logger.error(f"[{self.name}] 连接失败: {e}")
             return False
 
-    async def auth_interactive(self):
-        """Obtain interactive token (0% fees, 500ms speed bump)."""
+    def _auth_interactive_sync(self):
+        """Blocking interactive token request (runs in thread pool)."""
         import time as time_module
         from paradex_py.api.models import AuthSchema
 
@@ -588,6 +620,10 @@ class AccountTrader:
 
         self.last_auth_time = time_module.time()
         logger.info(f"[{self.name}] Interactive Token 获取成功")
+
+    async def auth_interactive(self):
+        """Async interactive token request — non-blocking."""
+        await asyncio.to_thread(self._auth_interactive_sync)
 
     async def refresh_token_if_needed(self, max_age: int = 240):
         """Auto-refresh token before expiry (token TTL ~5min, refresh at 4min)."""
@@ -849,11 +885,12 @@ class DualAccountController:
         if not await self._init_balances():
             return
 
-        # TG: 启动通知
+        # TG: 启动通知 + 后台指令轮询
         await self.tg.notify_startup(
             self.account_a.current_balance,
             self.account_b.current_balance,
         )
+        self.tg.start_polling()
 
         print()
         self.running = True
@@ -865,6 +902,7 @@ class DualAccountController:
         except KeyboardInterrupt:
             pass
         finally:
+            self.tg.stop_polling()
             await self.shutdown()
 
     async def _connect_accounts(self) -> bool:
@@ -941,18 +979,14 @@ class DualAccountController:
 
     async def main_loop(self):
         last_balance_check: float = 0
-        last_tg_poll: float = 0
 
         while self.running and self.cycle_count < MAX_CYCLES:
-            # ── Telegram /stop 检查 (每 3 秒轮询一次) ──
-            now = time.time()
-            if now - last_tg_poll > 3:
-                last_tg_poll = now
-                if await self.tg.check_stop():
-                    logger.info("Telegram /stop 指令触发停止")
-                    stats = self.pnl_tracker.get_stats(self.account_a, self.account_b)
-                    await self.tg.notify_error("Telegram /stop 指令", stats)
-                    break
+            # ── Telegram /stop (后台轮询, 这里只读 bool, 零开销) ──
+            if self.tg.stop_requested:
+                logger.info("Telegram /stop 指令触发停止")
+                stats = self.pnl_tracker.get_stats(self.account_a, self.account_b)
+                await self.tg.notify_error("Telegram /stop 指令", stats)
+                break
 
             # 安全检查
             if os.path.exists(EMERGENCY_STOP_FILE):
@@ -969,9 +1003,11 @@ class DualAccountController:
                 break
 
             try:
-                # 刷新两个账户的 Token (每 240s)
-                await self.account_a.refresh_token_if_needed(240)
-                await self.account_b.refresh_token_if_needed(240)
+                # 刷新两个账户的 Token (每 240s, 并行)
+                await asyncio.gather(
+                    self.account_a.refresh_token_if_needed(240),
+                    self.account_b.refresh_token_if_needed(240),
+                )
 
                 # 周期性更新余额 (每 10s)
                 now = time.time()
