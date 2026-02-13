@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import math
 import time
@@ -7,15 +8,14 @@ import sys
 from collections import deque
 from decimal import Decimal
 from enum import Enum
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from config import (
     COIN_PRESETS, DEFAULT_COIN,
     MARKET, ORDER_SIZE, MIN_ORDER_SIZE, SIZE_DECIMALS,
     MAX_CYCLES, PARADEX_ENV,
     MAX_CONSECUTIVE_FAILURES, EMERGENCY_STOP_FILE,
-    ACCOUNT_A_L2_ADDRESS, ACCOUNT_A_L2_PRIVATE_KEY,
-    ACCOUNT_B_L2_ADDRESS, ACCOUNT_B_L2_PRIVATE_KEY,
+    ACCOUNT_GROUPS, RATE_LIMITS_FILE,
     ZERO_SPREAD_THRESHOLD, ENTRY_ZERO_SPREAD_MS, DEPTH_SAFETY_FACTOR,
     MAX_HOLD_SECONDS,
     BURST_ZERO_SPREAD_MS, BURST_MIN_DEPTH,
@@ -58,6 +58,102 @@ MAX_ORDERS_PER_HALF_HOUR = 300
 MAX_ORDERS_PER_DAY = 1000
 
 
+# ─── Rate Persistence ───
+class RatePersistence:
+    """Persists per-account order timestamps to JSON file. Survives restarts."""
+
+    def __init__(self, filepath: str = RATE_LIMITS_FILE):
+        self.filepath = filepath
+        self._data: Dict[str, List[float]] = self._load()
+
+    def _load(self) -> Dict[str, List[float]]:
+        """Load from disk, clean expired entries (>24h)."""
+        if not os.path.exists(self.filepath):
+            return {}
+        try:
+            with open(self.filepath, "r") as f:
+                raw = json.load(f)
+            now = time.time()
+            cleaned = {}
+            for addr, timestamps in raw.items():
+                valid = [t for t in timestamps if now - t < 86400]
+                if valid:
+                    cleaned[addr] = valid
+            return cleaned
+        except Exception as e:
+            logger.warning(f"速率文件加载失败, 将重新创建: {e}")
+            return {}
+
+    def _save(self):
+        """Atomic write: write to .tmp then rename."""
+        tmp = self.filepath + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(self._data, f)
+            os.replace(tmp, self.filepath)
+        except Exception as e:
+            logger.error(f"速率文件保存失败: {e}")
+
+    def get_orders(self, l2_address: str) -> List[float]:
+        """Get valid (non-expired) timestamps for an account."""
+        now = time.time()
+        timestamps = self._data.get(l2_address, [])
+        valid = [t for t in timestamps if now - t < 86400]
+        self._data[l2_address] = valid
+        return valid
+
+    def record(self, l2_address: str, timestamp: float):
+        """Append a new order timestamp and persist to disk."""
+        if l2_address not in self._data:
+            self._data[l2_address] = []
+        self._data[l2_address].append(timestamp)
+        self._save()
+
+    def can_trade(self, l2_address: str) -> tuple[bool, float, str]:
+        """Check if an account can trade based on persisted history."""
+        now = time.time()
+        timestamps = self.get_orders(l2_address)
+
+        minute_orders = [t for t in timestamps if now - t < 60]
+        half_hour_orders = [t for t in timestamps if now - t < 1800]
+        day_orders = timestamps  # already cleaned to <24h
+
+        if len(minute_orders) >= MAX_ORDERS_PER_MINUTE:
+            return False, 60 - (now - minute_orders[0]), "分钟"
+        if len(half_hour_orders) >= MAX_ORDERS_PER_HALF_HOUR:
+            return False, 1800 - (now - half_hour_orders[0]), "30分钟"
+        if len(day_orders) >= MAX_ORDERS_PER_DAY:
+            return False, 86400 - (now - day_orders[0]), "24h"
+        return True, 0, ""
+
+    def get_counts(self, l2_address: str) -> tuple[int, int, int]:
+        """Returns (minute_count, half_hour_count, day_count) for display."""
+        now = time.time()
+        timestamps = self.get_orders(l2_address)
+        minute = sum(1 for t in timestamps if now - t < 60)
+        half_hour = sum(1 for t in timestamps if now - t < 1800)
+        day = len(timestamps)
+        return minute, half_hour, day
+
+    def earliest_unlock(self, l2_address: str) -> float:
+        """Returns seconds until the earliest rate limit unlocks for this account."""
+        now = time.time()
+        timestamps = self.get_orders(l2_address)
+
+        waits = []
+        minute_orders = [t for t in timestamps if now - t < 60]
+        half_hour_orders = [t for t in timestamps if now - t < 1800]
+
+        if len(minute_orders) >= MAX_ORDERS_PER_MINUTE:
+            waits.append(60 - (now - minute_orders[0]))
+        if len(half_hour_orders) >= MAX_ORDERS_PER_HALF_HOUR:
+            waits.append(1800 - (now - half_hour_orders[0]))
+        if len(timestamps) >= MAX_ORDERS_PER_DAY:
+            waits.append(86400 - (now - timestamps[0]))
+
+        return min(waits) if waits else 0
+
+
 # ─── State ───
 class StrategyState(Enum):
     IDLE = "IDLE"
@@ -66,15 +162,38 @@ class StrategyState(Enum):
 
 # ─── Rate Limiter ───
 class RateLimiter:
-    """Sliding-window rate limiter (minute / 30min / day)."""
+    """Sliding-window rate limiter (minute / 30min / day) with persistence."""
 
-    def __init__(self, per_minute: int, per_half_hour: int, per_day: int):
+    def __init__(self, per_minute: int, per_half_hour: int, per_day: int,
+                 l2_address: str = "", persistence: Optional[RatePersistence] = None):
         self.per_minute = per_minute
         self.per_half_hour = per_half_hour
         self.per_day = per_day
+        self.l2_address = l2_address
+        self.persistence = persistence
         self.minute_orders: deque = deque()
         self.half_hour_orders: deque = deque()
         self.day_orders: deque = deque()
+
+        # Restore history from persistence file on startup
+        if persistence and l2_address:
+            self._restore_from_persistence()
+
+    def _restore_from_persistence(self):
+        """Load historical timestamps from persistence into deques."""
+        timestamps = self.persistence.get_orders(self.l2_address)
+        now = time.time()
+        for t in timestamps:
+            age = now - t
+            if age < 86400:
+                self.day_orders.append(t)
+            if age < 1800:
+                self.half_hour_orders.append(t)
+            if age < 60:
+                self.minute_orders.append(t)
+        if timestamps:
+            logger.info(f"[{self.l2_address[:10]}...] 恢复历史下单记录: "
+                        f"{len(self.minute_orders)}m/{len(self.half_hour_orders)}h/{len(self.day_orders)}d")
 
     def can_place_order(self) -> tuple[bool, float, str]:
         now = time.time()
@@ -98,6 +217,9 @@ class RateLimiter:
         self.minute_orders.append(now)
         self.half_hour_orders.append(now)
         self.day_orders.append(now)
+        # Persist to disk
+        if self.persistence and self.l2_address:
+            self.persistence.record(self.l2_address, now)
 
     def get_counts(self) -> tuple[int, int, int]:
         """Returns (minute_count, half_hour_count, day_count)."""
@@ -277,15 +399,17 @@ class TelegramNotifier:
         except Exception as e:
             logger.error(f"TG 发送失败: {e}")
 
-    async def notify_startup(self, bal_a: float, bal_b: float):
+    async def notify_startup(self, bal_a: float, bal_b: float,
+                             group_name: str = "", total_groups: int = 1):
         """策略启动通知"""
+        group_text = f" | 组: {group_name} ({total_groups}组)" if group_name else ""
         msg = (
             "🚀 <b>Paradex 双账户对冲套利已启动</b>\n"
             "\n"
-            f"📊 市场: {MARKET} | 最大单量: {ORDER_SIZE} {COIN_SYMBOL} (动态)\n"
+            f"📊 市场: {MARKET} | 最大单量: {ORDER_SIZE} {COIN_SYMBOL} (动态){group_text}\n"
             f"🚦 限速: {MAX_ORDERS_PER_MINUTE}/分 | {MAX_ORDERS_PER_HALF_HOUR}/30分 | {MAX_ORDERS_PER_DAY}/日 (每账户)\n"
-            f"💰 A 余额: ${bal_a:.4f}\n"
-            f"💰 B 余额: ${bal_b:.4f}\n"
+            f"💰 Long 余额: ${bal_a:.4f}\n"
+            f"💰 Short 余额: ${bal_b:.4f}\n"
             f"💰 合计: ${bal_a + bal_b:.4f}\n"
             "\n"
             f"📡 发送 /stop 可远程停止脚本\n"
@@ -574,12 +698,16 @@ class MarketObserver:
 class AccountTrader:
     """Single Paradex account: auth, market orders, balance, rate limiting."""
 
-    def __init__(self, name: str, l2_address: str, l2_private_key: str):
+    def __init__(self, name: str, l2_address: str, l2_private_key: str,
+                 persistence: Optional[RatePersistence] = None):
         self.name = name
         self.l2_address = l2_address
         self.l2_private_key = l2_private_key
         self.paradex: Optional[ParadexSubkey] = None
-        self.rate_limiter = RateLimiter(MAX_ORDERS_PER_MINUTE, MAX_ORDERS_PER_HALF_HOUR, MAX_ORDERS_PER_DAY)
+        self.rate_limiter = RateLimiter(
+            MAX_ORDERS_PER_MINUTE, MAX_ORDERS_PER_HALF_HOUR, MAX_ORDERS_PER_DAY,
+            l2_address=l2_address, persistence=persistence,
+        )
         self.last_auth_time: float = 0
         self.initial_balance: float = 0.0
         self.current_balance: float = 0.0
@@ -786,7 +914,7 @@ class C:
 class FixedPanel:
     """Fixed-position terminal panel with ANSI overwrite refresh."""
 
-    PANEL_LINES = 14
+    PANEL_LINES = 15
 
     def __init__(self):
         self.initialized = False
@@ -809,7 +937,7 @@ class FixedPanel:
 
 # ─── Strategy Controller ───
 class DualAccountController:
-    """Core state machine: IDLE ⇄ HOLDING, with optional BURST acceleration."""
+    """Core state machine: IDLE ⇄ HOLDING, with multi-group rotation and persistent rate limits."""
 
     def __init__(self):
         self.observer = MarketObserver()
@@ -819,6 +947,15 @@ class DualAccountController:
         self.latency_tracker = LatencyTracker()
         self.panel = FixedPanel()
         self.tg = TelegramNotifier(TG_BOT_TOKEN, TG_CHAT_ID, TG_ENABLED)
+
+        # Persistence & groups
+        self.persistence = RatePersistence(RATE_LIMITS_FILE)
+        self.groups: List[dict] = ACCOUNT_GROUPS
+        self.current_group_idx: int = -1
+        self.current_group_name: str = ""
+
+        # WS account (shared across group switches, uses first group's long account)
+        self.ws_account: Optional[AccountTrader] = None
 
         # 状态
         self.state = StrategyState.IDLE
@@ -845,6 +982,115 @@ class DualAccountController:
         self._last_tg_cycle: int = 0          # 上次发 TG 时的循环数
         self._burst_notified: bool = False     # 本次冲刺窗口是否已通知
 
+    # ─── Group Management ───
+
+    def _validate_groups(self) -> bool:
+        """Validate ACCOUNT_GROUPS config: at least 1 group with all required fields."""
+        if not self.groups:
+            print(f"{C.BRED}❌ ACCOUNT_GROUPS 为空! 请在 config.py 中配置至少一组账户{C.RST}")
+            return False
+
+        required = ["name", "l2_address_long", "l2_private_key_long",
+                     "l2_address_short", "l2_private_key_short"]
+        for i, g in enumerate(self.groups):
+            for field in required:
+                if not g.get(field):
+                    print(f"{C.BRED}❌ 账户组 {i} ({g.get('name', '?')}) 缺少字段: {field}{C.RST}")
+                    return False
+        return True
+
+    def _find_available_group(self) -> int:
+        """Find the first group where both accounts can trade. Returns index or -1."""
+        for i, g in enumerate(self.groups):
+            can_long, _, _ = self.persistence.can_trade(g["l2_address_long"])
+            can_short, _, _ = self.persistence.can_trade(g["l2_address_short"])
+            if can_long and can_short:
+                return i
+        return -1
+
+    def _calc_wait_time(self) -> float:
+        """Calculate seconds until any group becomes available again."""
+        min_wait = float("inf")
+        for g in self.groups:
+            wait_long = self.persistence.earliest_unlock(g["l2_address_long"])
+            wait_short = self.persistence.earliest_unlock(g["l2_address_short"])
+            group_wait = max(wait_long, wait_short)  # both must be free
+            min_wait = min(min_wait, group_wait)
+        return min_wait if min_wait != float("inf") else 0
+
+    async def _connect_group(self, group_idx: int) -> bool:
+        """Connect a specific group's two accounts (long + short)."""
+        g = self.groups[group_idx]
+        env = "prod" if PARADEX_ENV == "MAINNET" else "testnet"
+        name = g["name"]
+
+        print(f"🔌 连接组 {C.BOLD}{name}{C.RST} — 做多账户 ({env})...")
+        self.account_a = AccountTrader(
+            f"{name}-Long", g["l2_address_long"], g["l2_private_key_long"],
+            persistence=self.persistence,
+        )
+        if not await self.account_a.connect():
+            print(f"❌ 组 {name} 做多账户连接失败!")
+            return False
+        print(f"✅ 组 {name} 做多账户连接成功 (Interactive Token)")
+
+        print(f"🔌 连接组 {C.BOLD}{name}{C.RST} — 做空账户 ({env})...")
+        self.account_b = AccountTrader(
+            f"{name}-Short", g["l2_address_short"], g["l2_private_key_short"],
+            persistence=self.persistence,
+        )
+        if not await self.account_b.connect():
+            print(f"❌ 组 {name} 做空账户连接失败!")
+            return False
+        print(f"✅ 组 {name} 做空账户连接成功 (Interactive Token)")
+
+        self.current_group_idx = group_idx
+        self.current_group_name = name
+
+        # First group also serves as WS provider
+        if self.ws_account is None:
+            self.ws_account = self.account_a
+
+        return True
+
+    async def _switch_group(self) -> bool:
+        """Close current positions if holding, then switch to next available group."""
+        old_name = self.current_group_name
+
+        # 1. Close positions if holding
+        if self.state == StrategyState.HOLDING:
+            logger.info(f"组 {old_name} 限额满, 先平仓当前持仓...")
+            await self._close_both(emergency=True)
+
+        # 2. Find next available group
+        new_idx = self._find_available_group()
+        if new_idx < 0:
+            return False
+
+        logger.info(f"切换: 组 {old_name} → 组 {self.groups[new_idx]['name']}")
+
+        # 3. Connect new group
+        if not await self._connect_group(new_idx):
+            return False
+
+        # 4. Init balances for new group
+        if not await self._init_balances():
+            return False
+
+        # 5. TG notification
+        await self.tg.send(
+            f"🔄 <b>组切换: {old_name} → {self.current_group_name}</b>\n"
+            f"💰 Long: ${self.account_a.current_balance:.2f} | "
+            f"Short: ${self.account_b.current_balance:.2f}"
+        )
+
+        # Reset state for new group
+        self.state = StrategyState.IDLE
+        self.consecutive_failures = 0
+        self.current_position_size = 0
+
+        return True
+
     # ─── Startup ───
 
     async def start(self):
@@ -852,7 +1098,7 @@ class DualAccountController:
         BAR = f"{C.BCYAN}{'━' * W}{C.RST}"
         print()
         print(BAR)
-        print(f"  {C.BOLD}{C.BWHITE}PARADEX DUAL HEDGE v1{C.RST}"
+        print(f"  {C.BOLD}{C.BWHITE}PARADEX DUAL HEDGE v2{C.RST}"
               f"  {C.DIM}RPI Negative Spread Arbitrage{C.RST}")
         print(BAR)
         print(f"  {C.BOLD}MARKET{C.RST}  {C.BWHITE}{MARKET}{C.RST}"
@@ -867,18 +1113,41 @@ class DualAccountController:
         print(f"  {C.BOLD}RATE{C.RST}    {MAX_ORDERS_PER_MINUTE}/min"
               f"  {MAX_ORDERS_PER_HALF_HOUR}/30min"
               f"  {MAX_ORDERS_PER_DAY}/day {C.DIM}(per account){C.RST}")
+        group_names = ", ".join(g["name"] for g in self.groups)
+        print(f"  {C.BOLD}GROUPS{C.RST}  {C.BWHITE}{len(self.groups)}{C.RST}"
+              f" [{group_names}]"
+              f"    {C.BOLD}PERSIST{C.RST}  {C.DIM}{RATE_LIMITS_FILE}{C.RST}")
         print(BAR)
         print()
 
-        # 检查配置
-        if not ACCOUNT_A_L2_ADDRESS or not ACCOUNT_A_L2_PRIVATE_KEY:
-            print("❌ 未配置账户 A 的 L2 密钥! 请编辑 config.py")
-            return
-        if not ACCOUNT_B_L2_ADDRESS or not ACCOUNT_B_L2_PRIVATE_KEY:
-            print("❌ 未配置账户 B 的 L2 密钥! 请编辑 config.py")
+        # Validate groups
+        if not self._validate_groups():
             return
 
-        if not await self._connect_accounts():
+        # Load persistence & find first available group
+        start_idx = self._find_available_group()
+        if start_idx < 0:
+            wait = self._calc_wait_time()
+            print(f"⏳ 所有账户组都已达到限额! 最快可用时间: {wait:.0f}s 后")
+            print(f"   等待中...")
+            await self._wait_for_available_group()
+            start_idx = self._find_available_group()
+            if start_idx < 0:
+                print("❌ 无可用账户组, 退出")
+                return
+
+        # Show persisted counts
+        for g in self.groups:
+            m_l, h_l, d_l = self.persistence.get_counts(g["l2_address_long"])
+            m_s, h_s, d_s = self.persistence.get_counts(g["l2_address_short"])
+            avail = "✅" if self._group_available(g) else "⛔"
+            print(f"  {avail} 组 {C.BOLD}{g['name']}{C.RST}"
+                  f"  Long: {m_l}m/{h_l}h/{d_l}d"
+                  f"  Short: {m_s}m/{h_s}h/{d_s}d")
+
+        print()
+
+        if not await self._connect_group(start_idx):
             return
         if not await self._subscribe_bbo():
             return
@@ -889,6 +1158,8 @@ class DualAccountController:
         await self.tg.notify_startup(
             self.account_a.current_balance,
             self.account_b.current_balance,
+            group_name=self.current_group_name,
+            total_groups=len(self.groups),
         )
         self.tg.start_polling()
 
@@ -905,34 +1176,33 @@ class DualAccountController:
             self.tg.stop_polling()
             await self.shutdown()
 
-    async def _connect_accounts(self) -> bool:
-        """Connect both accounts sequentially (each requires L2 auth)."""
-        env = "prod" if PARADEX_ENV == "MAINNET" else "testnet"
+    def _group_available(self, g: dict) -> bool:
+        """Check if both accounts in a group can trade."""
+        can_l, _, _ = self.persistence.can_trade(g["l2_address_long"])
+        can_s, _, _ = self.persistence.can_trade(g["l2_address_short"])
+        return can_l and can_s
 
-        print(f"🔌 连接账户 A ({env})...")
-        self.account_a = AccountTrader("A", ACCOUNT_A_L2_ADDRESS, ACCOUNT_A_L2_PRIVATE_KEY)
-        if not await self.account_a.connect():
-            print("❌ 账户 A 连接失败!")
-            return False
-        print("✅ 账户 A 连接成功 (Interactive Token)")
-
-        print(f"🔌 连接账户 B ({env})...")
-        self.account_b = AccountTrader("B", ACCOUNT_B_L2_ADDRESS, ACCOUNT_B_L2_PRIVATE_KEY)
-        if not await self.account_b.connect():
-            print("❌ 账户 B 连接失败!")
-            return False
-        print("✅ 账户 B 连接成功 (Interactive Token)")
-
-        return True
+    async def _wait_for_available_group(self):
+        """Block until at least one group is available, showing countdown."""
+        while True:
+            idx = self._find_available_group()
+            if idx >= 0:
+                return
+            wait = self._calc_wait_time()
+            if wait <= 0:
+                return
+            print(f"\r  ⏳ 所有组限额满, 等待 {wait:.0f}s...", end="", flush=True)
+            await asyncio.sleep(min(wait, 5))
 
     async def _subscribe_bbo(self) -> bool:
-        """Subscribe to BBO via Account A's WebSocket."""
+        """Subscribe to BBO via WS account (shared across group switches)."""
         try:
+            ws_src = self.ws_account or self.account_a
             print("📡 连接 WebSocket...")
-            await self.account_a.paradex.ws_client.connect()
+            await ws_src.paradex.ws_client.connect()
 
             print(f"📊 订阅 {MARKET} BBO...")
-            await self.account_a.paradex.ws_client.subscribe(
+            await ws_src.paradex.ws_client.subscribe(
                 ParadexWebsocketChannel.BBO,
                 callback=self.observer.on_bbo_update,
                 params={"market": MARKET},
@@ -959,10 +1229,10 @@ class DualAccountController:
         )
 
         if bal_a <= 0:
-            print(f"❌ 账户 A 余额获取失败: {bal_a}")
+            print(f"❌ 做多账户余额获取失败: {bal_a}")
             return False
         if bal_b <= 0:
-            print(f"❌ 账户 B 余额获取失败: {bal_b}")
+            print(f"❌ 做空账户余额获取失败: {bal_b}")
             return False
 
         self.account_a.initial_balance = bal_a
@@ -970,8 +1240,8 @@ class DualAccountController:
         self.account_b.initial_balance = bal_b
         self.account_b.current_balance = bal_b
 
-        print(f"💰 账户 A 余额: ${bal_a:.4f} USDC")
-        print(f"💰 账户 B 余额: ${bal_b:.4f} USDC")
+        print(f"💰 做多账户余额: ${bal_a:.4f} USDC")
+        print(f"💰 做空账户余额: ${bal_b:.4f} USDC")
         print(f"💰 合计: ${bal_a + bal_b:.4f} USDC")
         return True
 
@@ -1021,6 +1291,16 @@ class DualAccountController:
                     ws_age_ms = (now - bbo["last_update"]) * 1000
                     self.latency_tracker.update_ws_latency(ws_age_ms)
 
+                # ── 检查当前组是否还有额度, 否则切换 ──
+                if self.state == StrategyState.IDLE:
+                    can_a, _, _ = self.account_a.can_trade()
+                    can_b, _, _ = self.account_b.can_trade()
+                    if not can_a or not can_b:
+                        logger.info(f"组 {self.current_group_name} 限额满, 尝试切换...")
+                        if not await self._try_switch_or_wait():
+                            break  # all exhausted and user stopped
+                        continue
+
                 # 状态机
                 if self.state == StrategyState.IDLE:
                     await self._handle_idle()
@@ -1035,6 +1315,42 @@ class DualAccountController:
                 self.consecutive_failures += 1
 
             await asyncio.sleep(0.05)
+
+    async def _try_switch_or_wait(self) -> bool:
+        """Try to switch group, or wait if all groups are full. Returns False to stop."""
+        if await self._switch_group():
+            return True
+
+        # All groups full — wait
+        while self.running:
+            if self.tg.stop_requested:
+                return False
+            if os.path.exists(EMERGENCY_STOP_FILE):
+                return False
+
+            wait = self._calc_wait_time()
+            if wait <= 0:
+                break
+
+            # Show wait info on panel
+            mins = wait / 60
+            self._update_display_waiting(wait)
+
+            if wait > 10:
+                logger.info(f"所有组限额满, 等待 {mins:.1f}m")
+                await self.tg.send(
+                    f"⏳ 所有账户组限额满, 等待 {mins:.1f} 分钟后自动恢复"
+                )
+
+            await asyncio.sleep(min(wait, 5))
+
+        # Try again after waiting
+        if await self._switch_group():
+            return True
+
+        # Still no group — shouldn't normally happen
+        logger.warning("等待后仍无可用组")
+        return True  # keep running, loop will re-check
 
     # ─── State Handlers ───
 
@@ -1096,7 +1412,7 @@ class DualAccountController:
 
         dir_text = "A多B空" if self.current_direction == "A_LONG" else "A空B多"
         bbo = self.observer.current_bbo
-        logger.info(f"开仓: {dir_text} | {size} {COIN_SYMBOL} "
+        logger.info(f"[{self.current_group_name}] 开仓: {dir_text} | {size} {COIN_SYMBOL} "
                      f"(薄边:{min(bbo['bid_size'], bbo['ask_size']):.4f})")
 
         # 并行下单 (asyncio.to_thread 让两个 HTTP 同时发出)
@@ -1170,7 +1486,7 @@ class DualAccountController:
             a_side, b_side = "BUY", "SELL"    # A 平空, B 平多
 
         tag = " (超时强制)" if emergency else ""
-        logger.info(f"平仓{tag} | {close_size} {COIN_SYMBOL}")
+        logger.info(f"[{self.current_group_name}] 平仓{tag} | {close_size} {COIN_SYMBOL}")
 
         # 并行平仓
         results = await asyncio.gather(
@@ -1355,6 +1671,10 @@ class DualAccountController:
         else:
             time_text = f"{elapsed_min:.1f}m"
 
+        # 组信息
+        grp_text = (f"{C.BOLD}GRP{C.RST} {C.BWHITE}{self.current_group_name}{C.RST}"
+                    f"/{len(self.groups)}")
+
         W = 74
         BAR = f"{C.BCYAN}{'━' * W}{C.RST}"
 
@@ -1363,7 +1683,8 @@ class DualAccountController:
             f"  {C.BOLD}{C.BWHITE}PARADEX DUAL HEDGE{C.RST}"
             f"  {C.state_badge(self.state.value)}"
             f"  {C.mode_badge(self.observer.mode)}"
-            f"  {C.DIM}{MARKET}{C.RST}",
+            f"  {C.DIM}{MARKET}{C.RST}"
+            f"  {grp_text}",
             BAR,
             # ── 行情 ──
             f"  {C.BOLD}PRICE{C.RST}  {C.BWHITE}${bbo['mid_price']:,.2f}{C.RST}"
@@ -1375,13 +1696,13 @@ class DualAccountController:
             f"    {C.BOLD}NEXT{C.RST}  {dir_text}",
             BAR,
             # ── 账户 ──
-            f"  {C.BOLD}{C.CYAN}A{C.RST}"
+            f"  {C.BOLD}{C.CYAN}L{C.RST}"
             f"  ${self.account_a.current_balance:>8.2f}"
             f"  {C.pnl(pnl_a)}"
             f"  {C.bar(min_a, MAX_ORDERS_PER_MINUTE, 6)} {min_a:>2}/{MAX_ORDERS_PER_MINUTE}m"
             f"  {C.bar(half_a, MAX_ORDERS_PER_HALF_HOUR, 6)} {half_a:>3}/{MAX_ORDERS_PER_HALF_HOUR}h"
             f"  {C.bar(day_a, MAX_ORDERS_PER_DAY, 6)} {day_a:>4}/{MAX_ORDERS_PER_DAY}d",
-            f"  {C.BOLD}{C.PURPLE}B{C.RST}"
+            f"  {C.BOLD}{C.PURPLE}S{C.RST}"
             f"  ${self.account_b.current_balance:>8.2f}"
             f"  {C.pnl(pnl_b)}"
             f"  {C.bar(min_b, MAX_ORDERS_PER_MINUTE, 6)} {min_b:>2}/{MAX_ORDERS_PER_MINUTE}m"
@@ -1402,6 +1723,45 @@ class DualAccountController:
             BAR,
         ]
 
+        self.panel.update(lines)
+
+    def _update_display_waiting(self, wait_seconds: float):
+        """Show a waiting panel when all groups are rate-limited."""
+        W = 74
+        BAR = f"{C.BCYAN}{'━' * W}{C.RST}"
+        mins = wait_seconds / 60
+
+        lines_info = []
+        for g in self.groups:
+            m_l, h_l, d_l = self.persistence.get_counts(g["l2_address_long"])
+            m_s, h_s, d_s = self.persistence.get_counts(g["l2_address_short"])
+            avail = f"{C.BGREEN}✅{C.RST}" if self._group_available(g) else f"{C.BRED}⛔{C.RST}"
+            lines_info.append(
+                f"  {avail} {C.BOLD}{g['name']}{C.RST}"
+                f"  L:{m_l}m/{h_l}h/{d_l}d"
+                f"  S:{m_s}m/{h_s}h/{d_s}d"
+            )
+
+        lines = [
+            BAR,
+            f"  {C.BOLD}{C.BYELLOW}⏳ ALL GROUPS RATE LIMITED{C.RST}"
+            f"  {C.DIM}{MARKET}{C.RST}",
+            BAR,
+            f"  {C.BOLD}WAIT{C.RST}  {C.BYELLOW}{mins:.1f}m{C.RST} remaining",
+            BAR,
+        ] + lines_info + [
+            BAR,
+            "",  # padding
+            "",
+            "",
+            "",
+            "",
+            "",
+            BAR,
+        ]
+
+        # Trim to PANEL_LINES
+        lines = lines[:self.panel.PANEL_LINES]
         self.panel.update(lines)
 
     # ─── Shutdown ───
@@ -1427,18 +1787,18 @@ class DualAccountController:
 
         print("\n" * 2)
         print("=" * 72)
-        print("📊 双账户对冲策略 - 最终统计")
+        print(f"📊 双账户对冲策略 - 最终统计 (组 {self.current_group_name})")
         print("=" * 72)
         print(f"   循环: {self.cycle_count} "
               f"(成功: {self.successful_cycles}, 失败: {self.failed_cycles})")
         print(f"   运行: {elapsed / 60:.1f} 分钟")
         print("-" * 72)
-        print("🅰️  账户 A:")
+        print(f"  做多账户 ({self.account_a.name}):")
         print(f"   初始: ${self.account_a.initial_balance:.4f} → "
               f"当前: ${self.account_a.current_balance:.4f}")
         print(f"   盈亏: ${self.account_a.get_pnl():+.4f} USDC | "
               f"下单: {self.account_a.order_count} 单")
-        print("🅱️  账户 B:")
+        print(f"  做空账户 ({self.account_b.name}):")
         print(f"   初始: ${self.account_b.initial_balance:.4f} → "
               f"当前: ${self.account_b.current_balance:.4f}")
         print(f"   盈亏: ${self.account_b.get_pnl():+.4f} USDC | "
@@ -1463,7 +1823,8 @@ class DualAccountController:
 
         # 关闭 WebSocket
         try:
-            await self.account_a.paradex.ws_client.close()
+            ws_src = self.ws_account or self.account_a
+            await ws_src.paradex.ws_client.close()
         except Exception:
             pass
 

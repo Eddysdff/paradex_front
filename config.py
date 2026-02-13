@@ -48,11 +48,27 @@ LOG_LEVEL = "INFO"
 MAX_CONSECUTIVE_FAILURES = 5   # 连续失败几次后暂停
 EMERGENCY_STOP_FILE = "STOP"   # 创建此文件可紧急停止
 
-# ─── 双账户密钥 ───
-ACCOUNT_A_L2_ADDRESS = ""
-ACCOUNT_A_L2_PRIVATE_KEY = ""
-ACCOUNT_B_L2_ADDRESS = ""
-ACCOUNT_B_L2_PRIVATE_KEY = ""
+# ─── 账户组 (按顺序轮换, 当前组限额满后自动切下一组) ───
+ACCOUNT_GROUPS = [
+    {
+        "name": "A",                       # 组名 (显示用)
+        "l2_address_long":  "",            # 做多账户 L2 地址
+        "l2_private_key_long": "",         # 做多账户私钥
+        "l2_address_short": "",            # 做空账户 L2 地址
+        "l2_private_key_short": "",        # 做空账户私钥
+    },
+    # 可添加更多组:
+    # {
+    #     "name": "B",
+    #     "l2_address_long": "",
+    #     "l2_private_key_long": "",
+    #     "l2_address_short": "",
+    #     "l2_private_key_short": "",
+    # },
+]
+
+# ─── 速率持久化 ───
+RATE_LIMITS_FILE = "rate_limits.json"      # 下单记录文件 (重启后恢复)
 
 # ─── 策略参数 ───
 ZERO_SPREAD_THRESHOLD = 0.0005  # 低于此值视为 0 点差 (%)
