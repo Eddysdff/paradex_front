@@ -428,7 +428,7 @@ class TelegramNotifier:
         pnl_emoji = "📈" if stats['pnl_total'] >= 0 else "📉"
 
         msg = (
-            f"📊 <b>进度报告 — 第 {cycle}/{MAX_CYCLES} 轮</b>\n"
+            f"📊 <b>进度报告 — 第 {cycle} 轮</b>\n"
             "\n"
             f"🔄 成交笔数: {cycle * 4} 笔 (每轮4笔)\n"
             f"📈 累计交易量: ${stats['volume']:,.0f}\n"
@@ -962,7 +962,8 @@ class DualAccountController:
         self.running = False
         self.start_time: Optional[float] = None
 
-        # 循环计数
+        # 循环计数 (MAX_CYCLES 按组数倍增)
+        self.total_max_cycles = MAX_CYCLES * len(self.groups)
         self.cycle_count = 0
         self.successful_cycles = 0
         self.failed_cycles = 0
@@ -1103,7 +1104,8 @@ class DualAccountController:
         print(BAR)
         print(f"  {C.BOLD}MARKET{C.RST}  {C.BWHITE}{MARKET}{C.RST}"
               f"    {C.BOLD}SIZE{C.RST}  {ORDER_SIZE} {COIN_SYMBOL} {C.DIM}(dynamic){C.RST}"
-              f"    {C.BOLD}MAX{C.RST}  {MAX_CYCLES} cycles")
+              f"    {C.BOLD}MAX{C.RST}  {self.total_max_cycles} cycles"
+              f" {C.DIM}({MAX_CYCLES}×{len(self.groups)}组){C.RST}")
         print(f"  {C.BOLD}ENTRY{C.RST}   0-gap ≥{ENTRY_ZERO_SPREAD_MS}ms"
               f"    {C.BOLD}SAFETY{C.RST}  ×{DEPTH_SAFETY_FACTOR}"
               f"    {C.BOLD}MIN{C.RST}  {MIN_ORDER_SIZE} {COIN_SYMBOL}")
@@ -1250,7 +1252,7 @@ class DualAccountController:
     async def main_loop(self):
         last_balance_check: float = 0
 
-        while self.running and self.cycle_count < MAX_CYCLES:
+        while self.running and self.cycle_count < self.total_max_cycles:
             # ── Telegram /stop (后台轮询, 这里只读 bool, 零开销) ──
             if self.tg.stop_requested:
                 logger.info("Telegram /stop 指令触发停止")
@@ -1538,7 +1540,7 @@ class DualAccountController:
             # ── 冲刺模式: 平仓后立即重新开仓 ──
             if (self.observer.mode == "burst"
                     and self.burst_rounds < MAX_ROUNDS_PER_BURST
-                    and self.cycle_count < MAX_CYCLES
+                    and self.cycle_count < self.total_max_cycles
                     and not emergency):
 
                 # 冲刺时放宽条件: 只要当前仍是 0 差就行, 动态算单量
@@ -1710,7 +1712,7 @@ class DualAccountController:
             f"  {C.bar(day_b, MAX_ORDERS_PER_DAY, 6)} {day_b:>4}/{MAX_ORDERS_PER_DAY}d",
             BAR,
             # ── 统计 ──
-            f"  {C.BOLD}CYCLES{C.RST}  {C.BWHITE}{self.cycle_count}{C.RST}/{MAX_CYCLES}"
+            f"  {C.BOLD}CYCLES{C.RST}  {C.BWHITE}{self.cycle_count}{C.RST}/{self.total_max_cycles}"
             f"   {C.GREEN}✓{self.successful_cycles}{C.RST}"
             f" {C.RED}✗{self.failed_cycles}{C.RST}"
             f"   {C.BOLD}BURST{C.RST} {self.burst_rounds}"
