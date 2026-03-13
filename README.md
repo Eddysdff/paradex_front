@@ -17,7 +17,7 @@ Paradex 的 Retail Profile 提供 0% maker/taker 费率。当 orderbook 出现 0
 ```
 
 - **动态单量**：根据盘口薄边深度自动调整，不穿透 orderbook
-- **冲刺模式**：检测到持续 0 差 + 厚深度时自动加速循环
+- **冲刺模式**：检测到持续 0 差 + 厚深度时自动加速冲刺
 - **多币种**：启动时选择 BTC / ETH / SOL
 
 ## 限制
@@ -52,4 +52,5 @@ python3 dual_scalper.py --coin ETH
 | `config.py` | 所有配置参数 |
 | `bbo_analysis.py` | BBO 数据离线分析 |
 | `scalper.py` | 旧版单账户脚本 (参考) |
+
 
